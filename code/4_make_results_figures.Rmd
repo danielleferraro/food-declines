@@ -1,0 +1,1510 @@
+---
+title: "Explore event finder results and make figures"
+author: "Danielle Ferraro"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Overview
+
+This script explores the processed output of the event finder code (detailed in `3_process_event_finder_results.Rmd`) and makes figures from the results. 
+
+# Setup
+
+Load packages.
+```{r}
+library(here)
+library(janitor)
+library(vroom)
+library(tidyverse)
+library(ggpubr)
+library(ggExtra)
+library(paletteer)
+library(png) # For importing pngs
+library(grid) # For adding pngs to ggplot
+library(sf)
+library(rnaturalearth) 
+library(scatterpie)
+library(ggdist) # For distribution geoms - stat_halfeye()
+```
+
+Set directories.
+```{r}
+source(here::here("src", "directories.R"))
+```
+
+# Load data 
+
+```{r}
+# Raw food balance data
+food_balance <- vroom(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy_filtered.csv"), delim = ",", locale = locale(encoding = "latin1"))
+
+# Raw country metadata
+country_metadata <- read_csv(file.path(dir_raw_data, "FAO", "production", "CL_FI_COUNTRY_GROUPS.csv"), # From production dataset
+                             locale = locale(encoding = "latin1"), 
+                             col_types = cols("UN_Code" = col_integer())) %>% 
+  clean_names()
+
+# Raw food item metadata
+code_item_group <- read_csv(file.path(dir_raw_data, "FAO", "food_balance", "FoodBalanceSheets_Metadata_ItemGroupCode.csv"), locale = locale(encoding = "latin1")) %>% 
+  clean_names()
+
+# Food group key
+food_group_key <- read_csv(file.path(dir_data_bottlenecks, "keys", "fao_fbs_food_groups.csv"))
+
+# Food supply inclines list
+inclines <- read_csv(file.path(dir_data_bottlenecks, "declines", "characterized_inclines_2021-08-13.csv"))
+
+# Food supply declines list
+declines <- read_csv(file.path(dir_data_bottlenecks, "declines", "characterized_declines_2021-08-13.csv"))
+
+# Coincident events list
+coincident_events <- read_csv(file.path(dir_data_bottlenecks, "declines", "declines_w_coincident_inclines.csv"))
+
+# Time series with food supply declines
+ts_w_declines <- read_csv(file.path(dir_data_bottlenecks, "declines", "ts_w_declines_2021-08-13.csv"))
+
+# Time series with food supply inclines
+ts_w_inclines <- read_csv(file.path(dir_data_bottlenecks, "declines", "ts_w_inclines_2021-08-13.csv"))
+```
+
+# Explore declines 
+
+Some quick numbers. 
+```{r}
+# How many total time series, with or without declines?
+food_balance %>% 
+  filter(element_code == 645) %>% # Select food supply quantity only
+  filter(!(item %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% # Remove item totals
+  distinct(area, item, item_code) %>% 
+  nrow()
+# n = 12,883 individual items
+
+# How many unique countries with individual item time series
+food_balance %>% 
+  filter(element_code == 645) %>% # Select food supply quantity only
+  filter(!(item %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% # Remove item totals
+  distinct(area) %>% 
+  nrow() # n = 159 countries
+  
+# Number of time series with at least one decline of any item
+nrow(distinct(ts_w_declines, area_code, item_code)) # n = 1,515
+
+# Proportion of time series with at least one decline
+nrow(distinct(ts_w_declines, area_code, item_code)) /
+  food_balance %>% 
+  filter(element_code == 645) %>% # Select food supply quantity only
+  filter(!(item %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% # Remove item totals
+  distinct(area, item, item_code) %>% 
+  nrow()
+
+# Number of decline events (may be >1 in a time series)
+nrow(declines) # n = 1,689
+
+# Proportional frequency
+nrow(declines) / 
+  food_balance %>% 
+  filter(element_code == 645) %>% # Select food supply quantity only
+  filter(!(item %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% # Remove item totals
+  distinct(area, item, item_code) %>% 
+  nrow()
+
+# Quick list of declines by area/food item.
+data.frame(table(declines$area)) %>% 
+  arrange(-Freq)
+data.frame(table(declines$item)) %>% 
+  arrange(-Freq)
+  
+# What is the spread of decline durations? 
+summary(declines$duration)
+hist(declines$duration, breaks = 10, xlab = "Duration (y)")
+
+# What is the spread of decline magnitudes?
+summary(declines$prop_change)
+hist(declines$prop_change, breaks = 10, xlab = "Proportion")
+
+# How many declines in each bin or category?
+table(declines$magnitude_bin)
+prop.table(table(declines$magnitude_bin)) # 44% of all declines have a magnitude of 0-50%; 56% 50-100%
+
+# How many time series have declines of 50-100% magnitude?
+declines %>% 
+  filter(magnitude_bin %in% c("(-0.75,-0.5]", "(-1,-0.75]")) %>% 
+  distinct(area, item_code) %>% 
+  nrow()
+
+# How many unique countries have declines of 50-100% magnitude?
+declines %>% 
+  filter(magnitude_bin %in% c("(-0.75,-0.5]", "(-1,-0.75]")) %>% 
+  distinct(area) %>% 
+  nrow()
+
+prop.table(table(declines$eco_class_group)) # 53.5 % of all declines are in developing nations, 23% in least developed, 23% in developed
+prop.table(table(declines$item_group)) # Most declines are in the cereals, fruits, and starchy roots categories. (note this is also a result of the number of unique items in each category)
+prop.table(table(declines$food_group)) 
+
+table(declines$eco_class_group, declines$magnitude_bin) 
+table(declines$item_group, declines$eco_class_group) # Declines in developing nations are primarily in the fruits, cereals, and starchy roots category
+table(declines$item_group, declines$magnitude_bin) # Declines in developing nations are primarily in the fruits, cereals, and starchy roots category
+table(declines$magnitude_bin, declines$duration_bin)
+```
+
+# Explore inclines
+
+```{r}
+# Quick summary of inclines.
+data.frame(table(inclines$area)) %>% 
+  arrange(-Freq)
+data.frame(table(inclines$item)) %>% 
+  arrange(-Freq)
+  
+# What is the spread of incline durations? 
+summary(inclines$duration)
+hist(inclines$duration, breaks = 10, xlab = "Duration (y)")
+
+# What is the spread of incline magnitudes?
+summary(inclines$prop_change)
+hist(inclines$prop_change, breaks = 10, xlab = "Proportion")
+ 
+# How many inclines in each bin or category?
+table(inclines$magnitude_bin)
+prop.table(table(inclines$magnitude_bin))
+
+prop.table(table(inclines$eco_class_group)) # 60% of all inclines are in developing nations, 18% in least developed, 22% in developed
+prop.table(table(inclines$item_group)) # Most inclines are in the cereals, fruits, and starchy roots categories. (note this is also a result of the number of unique items in each category)
+prop.table(table(inclines$food_group))
+
+table(inclines$eco_class_group, inclines$magnitude_bin) 
+table(inclines$item_group, inclines$eco_class_group) # inclines in developing nations are primarily in the fruits, cereals, and starchy roots category
+table(inclines$item_group, inclines$magnitude_bin) # inclines in developing nations are primarily in the fruits, cereals, and starchy roots category
+table(inclines$magnitude_bin, inclines$duration_bin)
+```
+
+# Exploratory plots
+
+## Declines 
+
+Rename ecoclass groups.
+```{r}
+declines <- declines %>% 
+  mutate(eco_class_group = case_when(eco_class_group == "Developed countries or areas" ~ "High Income",
+                                     eco_class_group == "Least Developed Countries" ~ "Low Income",
+                                     eco_class_group == "Other developing countries or areas" ~ "Middle Income"),
+         eco_class_group = fct_relevel(eco_class_group, "Low Income", after = Inf))
+```
+
+
+Number of declines:
+```{r}
+# Barplot of counts per summed food item group per ecoclass
+ggplot(declines, aes(x = item_group, fill = eco_class_group)) +
+  geom_bar(stat = "count") +
+  facet_wrap(~eco_class_group) +
+  coord_flip() +
+  labs(x = NULL, 
+       y = "Count", 
+       fill = "Ecoclass Group", 
+       title = "Num. declines in individual food item supply time series (n = 363)") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none")
+```
+
+Decline duration:
+```{r}
+# Boxplot of decline durations per summed food item group per ecoclass
+ggplot(declines, aes(x = eco_class_group, y = duration, color = eco_class_group)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.5) +
+  facet_wrap(~item_group) +
+  labs(x = NULL, y = "Duration (y)", title = "Duration of individual food item declines") +
+  ggpubr::theme_pubr() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "right") 
+
+# Boxplot of decline durations per summed food item group (no ecoclass)
+ggplot(declines, aes(x = fct_reorder(item_group, duration, .fun = "median"), y = duration, color = fct_reorder(item_group, duration, .fun = "median"))) +
+  geom_boxplot(size = 0.7, outlier.color = NA) +
+  geom_jitter(alpha = 0.2) +
+  coord_flip() +
+  labs(x = NULL, y = "Duration (y)", title = "Duration of individual food item declines") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none") 
+```
+
+Decline magnitude:
+```{r}
+# Boxplot of decline magnitudes per summed food item group per ecoclass
+ggplot(declines, aes(x = eco_class_group, y = prop_change, color = eco_class_group)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.5) +
+  facet_wrap(~item_group) +
+  labs(x = NULL, y = "Proportion", title = "Proportion change of individual food item declines") +
+  ggpubr::theme_pubr() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "right") 
+
+# Boxplot of decline magnitudes per summed food item group (no ecoclass)
+ggplot(declines, aes(x = fct_reorder(item_group, prop_change, .fun = "median", .desc = TRUE), y = prop_change, color = fct_reorder(item_group, prop_change, .fun = "median", .desc = TRUE))) +
+  geom_boxplot(size = 0.7, outlier.color = NA) +
+  geom_jitter(alpha = 0.2) +
+  coord_flip() +
+  labs(x = NULL, y = "Proportion", title = "Magnitude of individual food item declines") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none") 
+```
+
+Magnitude x Duration:
+```{r}
+# All declines, with marginal histograms
+{ggplot(declines, aes(x = duration, y = abs(prop_change))) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color  = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Duration (y)",
+       y = paste0("Percent change in food supply\n(absolute value)")) +
+    cowplot::theme_cowplot()} %>% 
+  ggMarginal(type = "histogram",
+             margins = "both",
+             fill = "steelblue")
+
+# Faceted by food group
+ggplot(declines, aes(x = duration, y = abs(prop_change))) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", aes(color  = food_group)) +
+  scale_y_continuous(limits = c(0,1), labels = scales::percent) +
+  facet_wrap(~food_group, ncol = 2) +
+  labs(x = "Duration (y)",
+       y = paste0("Percent change in food supply\n(absolute value)")) +
+  scale_color_paletteer_d(palette = "ggsci::default_igv") +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+
+# Average of each food group
+declines %>% 
+  group_by(food_group) %>% 
+  summarize(prop_change_mean = mean(prop_change),
+            prop_change_sd = sd(prop_change),
+            abs_change_mean = mean(abs_change),
+            duration_mean = mean(duration),
+            duration_sd = sd(duration)
+            ) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = duration_mean, y = abs(prop_change_mean), color = food_group)) +
+  geom_errorbar(aes(ymin = abs(prop_change_mean) - prop_change_sd, ymax = abs(prop_change_mean) + prop_change_sd)) +
+  geom_errorbarh(aes(xmin = duration_mean - duration_sd, xmax = duration_mean + duration_sd)) +
+  geom_point(aes(size = abs(abs_change_mean))) +
+  scale_color_paletteer_d(palette = "ggsci::default_igv") +
+  labs(x = "Mean duration (y)",
+       y = paste0("Mean percent change in food supply\n(absolute value)"),
+       color = "Food group",
+       size = "Mean absolute change in food supply\n(kg capita/yr)",
+       caption = "Error bars represent sd") +
+  scale_y_continuous(labels = scales::percent) +
+  cowplot::theme_cowplot()
+
+# Bins - facet by food group
+(mag_x_dur_food_group <- declines %>% 
+  ggplot(aes(x = abs(abs_change), y = duration)) +
+  geom_bin2d(bins = 30) +
+  #geom_hex() + # Why do white dots appear?
+  facet_wrap(~factor(food_group)) +
+  labs(x = "Absolute value of loss in food supply (kg capita/yr)",
+       y = "Duration (y)",
+       fill = "# declines") +
+  scale_fill_continuous(type = "viridis") +
+  cowplot::theme_minimal_grid()
+)
+
+# Bins - facet by geo region
+declines %>% 
+  ggplot(aes(x = abs(abs_change), y = duration)) +
+  geom_bin2d() +
+  #geom_hex() + # Why do white dots appear?
+  facet_wrap(~geo_region_group) +
+  labs(x = "Absolute value of loss in food supply (kg capita/yr)",
+       y = "Duration (y)",
+       fill = "# declines") +
+  scale_fill_continuous(type = "viridis") +
+  cowplot::theme_minimal_grid()
+
+# Bins - facet by eco class group
+declines %>% 
+  ggplot(aes(x = abs(abs_change), y = duration)) +
+  geom_bin2d() +
+  #geom_hex() + # Why do white dots appear?
+  facet_wrap(~eco_class_group) +
+  labs(x = "Absolute value of loss in food supply (kg capita/yr)",
+       y = "Duration (y)",
+       fill = "# declines") +
+  scale_fill_continuous(type = "viridis") +
+  cowplot::theme_minimal_grid()
+```
+
+Biplot of decline magnitude between sectors:
+```{r}
+declines %>% 
+  filter(sector == "Crops" | sector == "Meat, eggs, dairy") %>% 
+  group_by(area, area_code, eco_class_group, sector) %>% 
+  summarize(sum_abs_change = sum(abs_change),
+            n_declines = n())
+  
+
+# CROP X MEAT
+crop_meat <- { declines %>% 
+    filter(sector == "Crops" | sector == "Meat, eggs, dairy") %>% 
+    group_by(area, area_code, eco_class_group, sector) %>% 
+    summarize(median_prop_change = median(prop_change),
+              n_declines = n()) %>% 
+    group_by(area, area_code, eco_class_group) %>% 
+    mutate(n_declines = sum(n_declines)) %>% 
+    ungroup() %>% 
+    pivot_wider(names_from = "sector", values_from = "median_prop_change") %>% 
+    ggplot(aes(x = abs(Crops), y = abs(`Meat, eggs, dairy`))) +
+    geom_abline(intercept = 0, color = "gray50", linetype = "dashed") +
+    geom_point(alpha = 0.7) +
+    coord_fixed(ratio = 1, xlim = c(0,1), y = c(0,1)) +
+    labs(#x = "Median pct. decline in CROP items", 
+      #y = "Median pct. decline in MEAT items",
+      x = "CROPS",
+      y = "MEAT",
+      color = NULL,
+      size = "# declines",
+      title = "Crops X Meat") +
+    #scale_color_manual(values = c("darkred", "darkorange3", "gold")) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_x_continuous(labels = scales::percent_format()) +
+    ggpubr::theme_pubr(base_size = 14) +
+    theme(legend.position = "right") } %>% 
+  ggMarginal(type = "histogram",
+             margins = "both", 
+             xparams = list(fill = "#D72000FF"),
+             yparams = list(fill = "#EE6100FF"))
+
+# CROP X SEAFOOD
+crop_sea <- { declines %>% 
+    filter(sector == "Crops" | sector == "Seafood") %>% 
+    group_by(area, area_code, eco_class_group, sector) %>% 
+    summarize(median_prop_change = median(prop_change),
+              n_declines = n()) %>% 
+    group_by(area, area_code, eco_class_group) %>% 
+    mutate(n_declines = sum(n_declines)) %>% 
+    ungroup() %>% 
+    pivot_wider(names_from = "sector", values_from = "median_prop_change") %>% 
+    ggplot(aes(x = abs(Crops), y = abs(Seafood))) +
+    geom_abline(intercept = 0, color = "gray50", linetype = "dashed") +
+    geom_point(alpha = 0.7) +
+    coord_fixed(ratio = 1, xlim = c(0,1), y = c(0,1)) +
+    labs(#x = "Median pct. decline in CROP items", 
+      #y = "Median pct. decline in SEAFOOD items",
+      x = "CROPS",
+      y = "SEAFOOD",
+      color = NULL,
+      size = "# declines",
+      title = "Crops X Seafood") +
+    scale_color_manual(values = c("darkred", "darkorange3", "gold")) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_x_continuous(labels = scales::percent_format()) +
+    ggpubr::theme_pubr(base_size = 14) +
+    theme(legend.position = "right") } %>% 
+  ggMarginal(type = "histogram",
+             margins = "both",
+             xparams = list(fill = "#D72000FF"),
+             yparams = list(fill = "#1BB6AFFF"))
+
+# SEAFOOD X MEAT
+sea_meat <- { declines %>% 
+    filter(sector == "Seafood" | sector == "Meat, eggs, dairy") %>% 
+    group_by(area, area_code, eco_class_group, sector) %>% 
+    summarize(median_prop_change = median(prop_change),
+              n_declines = n()) %>% 
+    group_by(area, area_code, eco_class_group) %>% 
+    mutate(n_declines = sum(n_declines)) %>% 
+    ungroup() %>% 
+    pivot_wider(names_from = "sector", values_from = "median_prop_change") %>% 
+    ggplot(aes(x = abs(`Meat, eggs, dairy`), y = abs(Seafood))) +
+    geom_abline(intercept = 0, color = "gray50", linetype = "dashed") +
+    geom_point(alpha = 0.7) +
+    coord_fixed(ratio = 1, xlim = c(0,1), y = c(0,1)) +
+    labs(#x = "Median pct. decline in MEAT items", 
+         #y = "Median pct. decline in SEAFOOD items",
+         x = "MEAT",
+         y = "SEAFOOD",
+         color = NULL,
+         size = "# declines",
+         title = "Meat X Seafood") +
+    scale_color_manual(values = c("darkred", "darkorange3", "gold")) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_x_continuous(labels = scales::percent_format()) +
+    ggpubr::theme_pubr(base_size = 14) +
+    theme(legend.position = "right") } %>% 
+  ggMarginal(type = "histogram",
+             margins = "both",
+             xparams = list(fill = "#EE6100FF"),
+             yparams = list(fill = "#1BB6AFFF"))
+
+ggarrange(crop_meat, crop_sea, sea_meat, ncol = 3, align = "hv", labels = "AUTO")
+
+# Need to do t tests here
+```
+## Inclines 
+
+Number of inclines:
+```{r}
+# Barplot of counts per summed food item group per ecoclass
+ggplot(inclines, aes(x = item_group, fill = eco_class_group)) +
+  geom_bar(stat = "count") +
+  facet_wrap(~eco_class_group) +
+  coord_flip() +
+  labs(x = NULL, 
+       y = "Count", 
+       fill = "Ecoclass Group", 
+       title = "Num. inclines in individual food item supply time series (n = 363)") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none")
+```
+
+Incline duration:
+```{r}
+# Boxplot of incline durations per summed food item group per ecoclass
+ggplot(inclines, aes(x = eco_class_group, y = duration, color = eco_class_group)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.5) +
+  facet_wrap(~item_group) +
+  labs(x = NULL, y = "Duration (y)", title = "Duration of individual food item inclines") +
+  ggpubr::theme_pubr() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "right") 
+
+# Boxplot of incline durations per summed food item group (no ecoclass)
+ggplot(inclines, aes(x = fct_reorder(item_group, duration, .fun = "median"), y = duration, color = fct_reorder(item_group, duration, .fun = "median"))) +
+  geom_boxplot(size = 0.7, outlier.color = NA) +
+  geom_jitter(alpha = 0.2) +
+  coord_flip() +
+  labs(x = NULL, y = "Duration (y)", title = "Duration of individual food item inclines") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none") 
+```
+
+Incline magnitude:
+```{r}
+# Boxplot of incline magnitudes per summed food item group per ecoclass
+ggplot(inclines, aes(x = eco_class_group, y = prop_change, color = eco_class_group)) +
+  geom_boxplot() +
+  geom_jitter(alpha = 0.5) +
+  facet_wrap(~item_group) +
+  labs(x = NULL, y = "Proportion", title = "Proportion change of individual food item inclines") +
+  ggpubr::theme_pubr() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "right") 
+
+# Boxplot of incline magnitudes per summed food item group (no ecoclass)
+ggplot(inclines, aes(x = fct_reorder(item_group, prop_change, .fun = "median", .desc = TRUE), y = prop_change, color = fct_reorder(item_group, prop_change, .fun = "median", .desc = TRUE))) +
+  geom_boxplot(size = 0.7, outlier.color = NA) +
+  geom_jitter(alpha = 0.2) +
+  coord_flip() +
+  labs(x = NULL, y = "Proportion", title = "Magnitude of individual food item inclines") +
+  cowplot::theme_minimal_hgrid() +
+  theme(legend.position = "none") 
+```
+
+# Figures 
+
+Isolate only the decline events that did not recover, using a recovery threshold of 95% of the original quantity
+```{r}
+declines_unrecovered <- filter(declines, recovery_0.95 == 0)
+
+# Proportion of time series with at least one UNRECOVERED decline
+ts_w_declines %>% 
+  filter(decline_id %in% declines_unrecovered$decline_id) %>% 
+  distinct(area_code, item_code) %>% 
+  nrow() /
+  food_balance %>% 
+  filter(element_code == 645) %>% # Select food supply quantity only
+  filter(!(item %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% # Remove item totals
+  distinct(area, item, item_code) %>% 
+  nrow()
+
+```
+
+## Bar plot of declines frequency per food group, with and without coincident events
+
+Load icons, and set X position for plotting along the Y axis.
+```{r}
+apple <- rasterGrob(readPNG(here("output", "figs", "icons", "apple_black.png")))
+sugarcane <- rasterGrob(readPNG(here("output", "figs", "icons", "sugarcane_black.png")))
+beer <- rasterGrob(readPNG(here("output", "figs", "icons", "beer_black.png")))
+milk <- rasterGrob(readPNG(here("output", "figs", "icons", "milk_black.png")))
+olivebranch <- rasterGrob(readPNG(here("output", "figs", "icons", "olivebranch_black.png")))
+grouper <- rasterGrob(readPNG(here("output", "figs", "icons", "grouper.png")))
+rice <- rasterGrob(readPNG(here("output", "figs", "icons", "rice.png")))
+cassava <- rasterGrob(readPNG(here("output", "figs", "icons", "cassava.png")))
+cow <- rasterGrob(readPNG(here("output", "figs", "icons", "cow.png")))
+
+icon_xmin <- -0.017
+icon_xmax <- -0.003
+```
+
+Plot
+```{r}
+# Number of total time series per food group
+n_ts_per_food_group <- food_balance %>% 
+  filter(element_code == 645) %>%  # Select supply only
+  left_join(select(food_group_key, item_code, item_group, item_group_code, food_group, sector), by = "item_code") %>% 
+  group_by(food_group) %>% 
+  summarize(n_ts = n_distinct(area_code, item_code))
+
+# Number of declines per food group (a) without coincident inclines, (b) with same-group coincident inclines, (c) with cross-group coincident inclines
+# Note: a decline can be associated with >1 coincident incline
+n_declines_per_food_group <- declines_unrecovered %>% 
+  left_join(select(coincident_events, decline_id, same_food_group), by = "decline_id") %>%
+  mutate(same_food_group = if_else(same_food_group == TRUE, "same_group", "diff_group", "none")) %>% 
+  group_by(food_group) %>% 
+  summarize(n_declines_no_inclines = length(same_food_group[same_food_group == "none"]),
+            n_declines_same_group = length(same_food_group[same_food_group == "same_group"]),
+            n_declines_diff_group = length(same_food_group[same_food_group == "diff_group"])) %>% 
+  left_join(declines_unrecovered %>% 
+              group_by(food_group) %>% 
+              summarize(n_declines_total = n()))
+
+# # Plot - option 1, bar to represent total decline frequency
+# left_join(n_ts_per_food_group, n_declines_per_food_group, by = "food_group") %>% 
+#   adorn_totals() %>% 
+#   mutate(across(starts_with("n_declines"), .fns = ~ ./n_ts)) %>%
+#   mutate(prop_declines_total = n_declines_total) %>% # Duplicating column before pivot so it can be used for plot labeling or ordering
+#   pivot_longer(starts_with("n_declines"), names_to = "group", values_to = "prop") %T>%
+#   print(n = Inf) %>% 
+#   
+#   
+#   ggplot() +
+#   geom_col(aes(x = prop, y = fct_relevel(fct_reorder(food_group, prop_declines_total), "Total", after = 0L), fill = factor(group, levels = c("n_declines_total", "n_declines_no_inclines", "n_declines_diff_group", "n_declines_same_group"))), position = position_dodge2(reverse = TRUE)) + 
+#   labs(x = "Decline frequency",
+#        y = NULL,
+#        fill = NULL) +
+#   scale_fill_paletteer_d("beyonce::X19", direction = 1, labels = c("n_declines_no_inclines" = "Decline without coincident incline",  "n_declines_diff_group" = "Decline with inter-group coincident incline", "n_declines_same_group" = "Decline with intra-group coincident incline", "n_declines_total" = "All declines")) +
+#   cowplot::theme_cowplot() +
+#   theme(legend.position = c(0.5,0.15))
+# 
+# ggsave(here("output", "figs", "declines_ms", "fig_declines_with_coincident_inclines.png"), height = 6, width = 10, units = "in", dpi = 300)
+# 
+# # Plot - option 2, direct labels
+# left_join(n_ts_per_food_group, n_declines_per_food_group, by = "food_group") %>% 
+#   mutate(across(starts_with("n_declines"), .fns = ~ ./n_ts)) %>%
+#   mutate(prop_declines_total = n_declines_total) %>% # Duplicating column before pivot so it can be used for plot labeling or ordering
+#   pivot_longer(starts_with("n_declines"), names_to = "group", values_to = "prop") %>% 
+#   filter(group != "n_declines_total") %>% 
+#   
+#   ggplot() +
+#   geom_col(aes(x = prop, y = fct_reorder(food_group, prop_declines_total), fill = fct_rev(factor(group, levels = c("n_declines_no_inclines", "n_declines_diff_group", "n_declines_same_group")))), position = "dodge") + 
+#   geom_text(data = . %>%
+#               group_by(food_group, prop_declines_total) %>% 
+#               summarize(max_prop = max(prop)),
+#             aes(x = max_prop + 0.005, y = food_group, label = scales::number(prop_declines_total,accuracy = 0.01)), hjust = 0) +
+#   labs(x = "Decline frequency",
+#        y = NULL,
+#        fill = NULL) +
+#   scale_fill_paletteer_d(pal, direction = 1, labels = c("n_declines_no_inclines" = "Decline without\ncoincident incline",  "n_declines_diff_group" = "Decline with inter-group\ncoincident incline", "n_declines_same_group" = "Decline with intra-group\ncoincident incline"), guide = guide_legend(reverse = TRUE)) +
+#   cowplot::theme_cowplot() +
+#   theme(legend.position = c(0.70,0.15))
+
+# Plot - option 3, no "declines without coincident incline" bar
+left_join(n_ts_per_food_group, n_declines_per_food_group, by = "food_group") %>% 
+  select(-n_declines_no_inclines) %>% 
+  adorn_totals() %>% 
+  mutate(across(starts_with("n_declines"), .fns = ~ ./n_ts)) %>%
+  mutate(prop_declines_total = n_declines_total) %>% # Duplicating column before pivot so it can be used for plot labeling or ordering
+  pivot_longer(starts_with("n_declines"), names_to = "group", values_to = "prop") %T>%
+  print(n = Inf) %>% 
+  
+  ggplot() +
+  geom_col(aes(x = prop, y = fct_relevel(fct_reorder(food_group, prop_declines_total), "Total", after = 0L), fill = factor(group, levels = c("n_declines_total", "n_declines_diff_group", "n_declines_same_group"))), position = position_dodge2(reverse = TRUE)) + 
+  annotation_custom(grob = cassava, xmin = icon_xmin, xmax = icon_xmax, ymin = 10.6, ymax = 11.4) +
+  annotation_custom(grob = beer, xmin = icon_xmin, xmax = icon_xmax, ymin = 9.25, ymax = 10.75) +
+  annotation_custom(grob = rice, xmin = icon_xmin, xmax = icon_xmax, ymin = 8.6, ymax = 9.4) +
+  annotation_custom(grob = apple, xmin = icon_xmin, xmax = icon_xmax, ymin = 6.75, ymax = 7.25) +
+  annotation_custom(grob = sugarcane, xmin = icon_xmin, xmax = icon_xmax, ymin = 7.5, ymax = 8.5) +
+  annotation_custom(grob = cow, xmin = icon_xmin, xmax = icon_xmax, ymin = 5.75, ymax = 6.25) +
+  annotation_custom(grob = milk, xmin = icon_xmin, xmax = icon_xmax, ymin = 4.25, ymax = 5.75) +
+  annotation_custom(grob = grouper, xmin = icon_xmin, xmax = icon_xmax, ymin = 3.25, ymax = 4.75) +
+  annotation_custom(grob = olivebranch, xmin = icon_xmin, xmax = icon_xmax, ymin = 2.5, ymax = 3.5) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Decline frequency",
+       y = NULL,
+       fill = NULL) +
+  scale_fill_manual(values = paletteer_d("beyonce::X7")[2:4],
+                    labels = c("n_declines_diff_group" = "Decline with inter-group coinciding incline", "n_declines_same_group" = "Decline with intra-group coinciding incline", "n_declines_total" = "All declines")) +
+  # scale_fill_paletteer_d("beyonce::X7", direction = 1, labels = c("n_declines_diff_group" = "Decline with inter-group coincident incline", "n_declines_same_group" = "Decline with intra-group coincident incline", "n_declines_total" = "All declines")) +
+  # scale_fill_manual(values = c("#8fa340","#4e6101","#374016"),
+  #                   labels = c("n_declines_diff_group" = "Decline with inter-group coincident incline", "n_declines_same_group" = "Decline with intra-group coincident incline", "n_declines_total" = "All declines")) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = c(0.45, 0.10),
+        axis.text.y = element_text(margin = margin(r = 30))) # Adding space for icons
+
+ggsave(here("output", "figs", "declines_ms", "fig_decline_frequency.png"), height = 6, width = 9.5, units = "in", dpi = 600)
+
+# old code: 
+# # All time series with or without declines, w number of declines appended
+# ts_summary <- food_balance %>% 
+#   filter(area_code < 5000 & area != "Sudan") %>% 
+#   filter(element_code == 645) %>%  # Select supply only
+#   filter(!item_code %in% unique(code_item_group$item_group_code)) %>% # Remove food item groups, keeping individual food items only
+#   distinct(area_code, area, item_code, item) %>% 
+#   group_by(area_code, area, item_code, item) %>% 
+#   summarise(num_ts = n()) %>% 
+#   ungroup() %>% 
+#   left_join(select(food_group_key, item_code, item_group, item_group_code, food_group, sector), by = "item_code") %>% 
+#   left_join((declines %>% 
+#                group_by(area_code, item_code) %>% 
+#                summarise(num_declines = n(),
+#                          num_ts_w_declines = 1)),
+#             by = c("area_code", "item_code")) %>% 
+#   mutate(num_declines = coalesce(num_declines, 0),
+#          num_ts_w_declines = coalesce(num_ts_w_declines, 0)) %>% 
+#   mutate(num_ts_no_declines = num_ts - num_ts_w_declines) %>%
+#   relocate(num_ts, .before = "num_declines")
+# 
+# ## Two food items ("Miscellaneous" and "Alcohol, Non-Food") do not have food supply time series
+# setdiff(unique(code_item_group$item_code), unique(ts_summary$item_code))
+# food_balance %>% filter(item_code == 2659 & element_code == 645) # no time series
+# food_balance %>% filter(item_code == 2899 & element_code == 645) # no time series
+# 
+# (coincident_inclines_summary <- coincident_events %>% 
+#     count(food_group, same_food_group) %>% 
+#     pivot_wider(names_from = same_food_group, values_from = n) %>% 
+#     rename(num_coincident_inclines_diff_group = `FALSE`,
+#            num_coincident_inclines_same_group = `TRUE`) %>% 
+#     mutate(across(everything(), ~replace_na(.x, 0))) %>%     
+#     left_join(declines %>% 
+#                 count(food_group, name = "num_declines")) %>% 
+#     mutate(prop_coincident_inclines_diff_group = num_coincident_inclines_diff_group/num_declines,
+#            prop_coincident_inclines_same_group = num_coincident_inclines_same_group/num_declines) %>% 
+#     select(food_group, num_declines, everything()) %>% 
+#     arrange(-num_declines) %>% 
+#     janitor::adorn_totals() %>% 
+#     mutate(prop_coincident_inclines_diff_group = if_else(food_group == "Total", NA_real_, prop_coincident_inclines_diff_group),
+#            prop_coincident_inclines_same_group = if_else(food_group == "Total", NA_real_, prop_coincident_inclines_same_group)) 
+#   )
+# 
+# coincident_inclines_summary %>% 
+#   select(food_group, num_declines, starts_with("prop")) %>% 
+#   stargazer::stargazer(summary = FALSE, type = "text")
+# 
+# # What % of declines have a coincident incline? 
+# declines %>% 
+#   select(area, area_code, item, item_code, item_group, item_group_code, food_group, decline_id) %>% 
+#   left_join(select(coincident_events,
+#                    decline_id, has_coincident_incline, item_incline, item_code_incline, food_group_incline, same_food_group),
+#             by = "decline_id") %>% 
+#   mutate(has_coincident_incline = replace_na(has_coincident_incline, 0)) %>% 
+#   distinct(decline_id, .keep_all = TRUE) %>% 
+#   count(has_coincident_incline, same_food_group) %>% 
+#   janitor::adorn_percentages(denominator = "col")
+# 
+# # Coincident inclines by food group
+# coincident_events %>% 
+#   count(food_group, food_group_incline) %>% 
+#   arrange(food_group, desc(n)) %>% 
+#   ggplot(aes(x = n, y = food_group_incline, fill = food_group_incline)) +
+#   geom_col() +
+#   facet_wrap(~food_group) +
+#   scale_fill_paletteer_d(palette = "ggsci::default_igv") +
+#   labs(x = "Number of coincident inclines",
+#        y = "Food group of coincident incline", 
+#        fill = NULL) +
+#   cowplot::theme_minimal_grid()
+# 
+# # Plot: number
+# ts_summary %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts_w_declines = sum(num_ts_w_declines),
+#             num_ts_no_declines = sum(num_ts_no_declines)) %>% 
+#   ungroup() %>% 
+#   mutate(food_group = fct_reorder(food_group, num_ts_w_declines)) %>% 
+#   pivot_longer(cols = starts_with("num"), names_to = "metric", values_to = "n") %>% 
+#   
+#   ggplot(aes(x = n, y = food_group, fill = factor(metric, levels = c("num_ts_no_declines", "num_ts_w_declines")))) + 
+#   geom_bar(position = "stack", stat = "identity") +
+#   scale_fill_paletteer_d(palette = "wesanderson::Chevalier1") +
+#   labs(y = NULL,
+#        x = NULL, 
+#        fill = NULL, 
+#        title = "Number of food supply time series <i style='color:#FDD262'>with</i> and <i style='color:#446455'>without</i> declines", 
+#        subtitle = "Total declines: n = 1,689") +
+#   cowplot::theme_minimal_hgrid() +
+#   theme(plot.title = element_markdown(),
+#         legend.position = "none",
+#         plot.title.position = "plot",
+#         axis.line = element_blank())
+# 
+# # Plot: proportion
+# ts_summary %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts_w_declines = sum(num_ts_w_declines),
+#             num_ts_no_declines = sum(num_ts_no_declines)) %>% 
+#   ungroup() %>% 
+#   mutate(prop_declines = num_ts_w_declines/(num_ts_w_declines+num_ts_no_declines)) %>% 
+#   mutate(food_group = fct_reorder(food_group, prop_declines)) %>% 
+#   mutate(declines = num_ts_w_declines) %>% # Duplicating column here to use later with ggtext()
+#   pivot_longer(cols = starts_with("num"), names_to = "metric", values_to = "n") %>% 
+#   ggplot(aes(x = n, y = food_group, fill = factor(metric, levels = c("num_ts_no_declines", "num_ts_w_declines")))) + 
+#   geom_bar(position = "fill", stat = "identity") +
+#   geom_text(aes(x = prop_declines + 0.01, y = food_group, label = paste0("n = ", declines)), color = "#FDD262", hjust = 0) +
+#   scale_fill_paletteer_d(palette = "wesanderson::Chevalier1") +
+#   labs(y = NULL,
+#        x = NULL, 
+#        fill = NULL, 
+#        title = "Proportion of food supply time series <i style='color:#FDD262'>with</i> and <i style='color:#446455'>without</i> declines",
+#        subtitle = "Total declines: n = 1,689") +
+#   cowplot::theme_minimal_hgrid() +
+#   theme(plot.title = element_markdown(),
+#         legend.position = "none",
+#         plot.title.position = "plot",
+#         axis.line = element_blank())
+# 
+# ts_w_declines_counts <- ts_summary %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts_w_declines = sum(num_ts_w_declines)) %>% 
+#   adorn_totals()
+# 
+# # FIGURE 2
+# ts_summary %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts = sum(num_ts),
+#             num_ts_w_declines = sum(num_ts_w_declines),
+#             num_ts_no_declines = sum(num_ts_no_declines)) %>% 
+#   ungroup() %>% 
+#   left_join(coincident_inclines_summary, by = "food_group") %>% 
+#   mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+#   adorn_totals() %>% 
+#   mutate(food_group = fct_reorder(food_group, num_ts_w_declines/num_ts),
+#          food_group = fct_relevel(food_group, "Total", after = 0L)) %>% # Set plotting order of bars
+#   select(food_group, starts_with("num")) %>% 
+#   mutate(prop_declines_no_ci = (num_declines-num_coincident_inclines_diff_group)/num_ts, # ci = coincident incline
+#          prop_declines_ci_diff_group = num_coincident_inclines_diff_group/num_ts,
+#          prop_declines_ci_same_group = num_coincident_inclines_same_group/num_ts) %>% 
+#   select(food_group, num_declines, starts_with("prop")) %>% 
+#   pivot_longer(cols = starts_with("prop"), names_to = "group", values_to = "prop") %>% 
+#   mutate(group = fct_relevel(group, c("prop_declines_no_ci", "prop_declines_ci_diff_group", "prop_declines_ci_same_group"))) %>% # Set plotting order of colors
+#   
+#   ggplot() +
+#   geom_col(aes(x = prop, y = food_group, fill = group), position = "stack") +
+#   geom_text(data = . %>% 
+#               group_by(food_group) %>% 
+#               summarize(prop = sum(prop)) %>% 
+#               left_join(ts_w_declines_counts), aes(x = prop + 0.005, y = food_group, label = paste0("n = ", num_ts_w_declines)), hjust = 0) +
+#   labs(x = "Percentage of total time series",
+#        y = "Food group",
+#        fill = NULL) +
+#   #scale_fill_manual(values = c("gray80", "gray50", "black"), labels = c("Decline without\ncoincident incline", "Decline with\ninter-group coincident incline", "Decline with\nintra-group coincident incline")) +
+#   scale_fill_paletteer_d(pal, direction = 1, labels = c("Decline without\ncoincident incline", "Decline with\ninter-group coincident incline", "Decline with\nintra-group coincident incline")) +
+#   scale_x_continuous(limits = c(0,0.33), labels = scales::percent) +
+#   cowplot::theme_cowplot() +
+#   theme(legend.position = c(0.70,0.15))
+# 
+# # Remove uncessary wrangling:
+# ts_summary %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts = sum(num_ts),
+#             num_ts_w_declines = sum(num_ts_w_declines),
+#             num_ts_no_declines = sum(num_ts_no_declines)) %>% 
+#   ungroup() %>% 
+#   left_join(coincident_inclines_summary, by = "food_group") %>% 
+#   mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+#   adorn_totals() %>% 
+#   mutate(food_group = fct_reorder(food_group, num_ts_w_declines/num_ts),
+#          food_group = fct_relevel(food_group, "Total", after = 0L)) %>% # Set plotting order of bars
+#   select(food_group, 
+#          num_ts_w_declines,
+#          num_coincident_inclines_diff_group,
+#          num_coincident_inclines_same_group) %>%
+#   mutate(num_no_coincident_inclines = num_ts_w_declines-num_coincident_inclines_diff_group-num_coincident_inclines_same_group) %>% 
+#   pivot_longer(cols = starts_with("prop"), names_to = "group", values_to = "prop") %>% 
+#   mutate(group = fct_relevel(group, c("prop_declines_no_ci", "prop_declines_ci_diff_group", "prop_declines_ci_same_group"))) %>% # Set plotting order of colors
+#   
+#   ggplot() +
+#   geom_col(aes(x = prop, y = food_group, fill = group), position = "stack") +
+#   geom_text(data = . %>% 
+#               group_by(food_group) %>% 
+#               summarize(prop = sum(prop)) %>% 
+#               left_join(ts_w_declines_counts), aes(x = prop + 0.005, y = food_group, label = paste0("n = ", num_ts_w_declines)), hjust = 0) +
+#   labs(x = "Percentage of total time series",
+#        y = "Food group",
+#        fill = NULL) +
+#   #scale_fill_manual(values = c("gray80", "gray50", "black"), labels = c("Decline without\ncoincident incline", "Decline with\ninter-group coincident incline", "Decline with\nintra-group coincident incline")) +
+#   scale_fill_paletteer_d(pal, direction = 1, labels = c("Decline without\ncoincident incline", "Decline with\ninter-group coincident incline", "Decline with\nintra-group coincident incline")) +
+#   scale_x_continuous(limits = c(0,0.33), labels = scales::percent) +
+#   cowplot::theme_cowplot() +
+#   theme(legend.position = c(0.70,0.15))
+# 
+# ggsave(here("output", "figs", "declines_ms", "fig_declines_with_coincident_inclines.png"), height = 6, width = 12, units = "in", dpi = 300)
+# 
+#   # Plot num coincident events across food groups (B&W)
+# 
+# all_ts <- food_balance %>% 
+#   filter(area_code < 5000 & area != "Sudan") %>% 
+#   filter(element_code == 645) %>%  # Select supply only
+#   mutate(item_is_aggregated = if_else(item_code %in% unique(code_item_group$item_group_code), TRUE, FALSE)) %>% 
+#   filter(item_is_aggregated == FALSE) %>%   
+#   distinct(area_code, area, item_code, item, item_is_aggregated) %>% 
+#   group_by(item, item_code) %>% 
+#   summarise(num_ts = n()) %>% 
+#   ungroup() %>% 
+#   left_join((declines %>% 
+#                group_by(item_code) %>% 
+#                summarise(num_declines = n())),
+#             by = "item_code") %>% 
+#   mutate(num_no_declines = num_ts - num_declines) %>% 
+#   left_join(food_group_key %>% 
+#               select(item_code, item_group, item_group_code, food_group, sector), by = "item_code") %>% 
+#   ungroup() 
+# 
+# # FIGURE 3
+# (fig_num_declines <- all_ts %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_declines = sum(num_declines),
+#             num_no_declines = sum(num_no_declines)) %>% 
+#   ungroup() %>% 
+#   left_join(coincident_inclines_summary) %>% 
+#   select(-num_coincident_inclines_diff_group) %>% 
+#   mutate(prop_declines = num_declines/(num_declines+num_no_declines),
+#          total_ts = num_declines + num_no_declines) %>% 
+#   mutate(food_group = fct_reorder(food_group, prop_declines)) %>% 
+#   mutate(declines = num_declines) %>% # Duplicating column here to use later with ggtext()
+#   mutate(num_declines = num_declines-num_coincident_inclines_same_group) %>% 
+#   pivot_longer(cols = starts_with("num"), names_to = "metric", values_to = "n") %>% 
+#   ggplot(aes(x = n, y = food_group, fill = factor(metric, levels = c("num_no_declines", "num_declines", "num_coincident_inclines_same_group")))) + 
+#   geom_bar(position = "fill", stat = "identity", color = "black") +
+#   geom_text(aes(x = prop_declines + 0.01, y = food_group, label = paste0("n = ", declines)), hjust = 0) +
+#   annotate(geom = "text", x = 0.293 + 0.12, y = 11, label = "time series with declines", hjust = 0) +
+#   scale_fill_manual(values = c("num_no_declines" = "white", "num_declines" = "gray80", "num_coincident_inclines_same_group" = "black"), 
+#                     labels = c("No decline\ndetected", "Decline without\ncoincident incline", "Decline with\ncoincident incline")) +
+#   labs(x = "Proportion of total time series",
+#        y = NULL,
+#        fill = NULL,
+#        title = "Coincident events within food groups") +
+#   cowplot::theme_minimal_hgrid() +
+#   theme(axis.line = element_blank())
+# )
+# 
+# # Plot num coincident events across food groups
+# all_ts %>% 
+#   group_by(food_group) %>% 
+#   summarise(num_ts = sum(num_ts),
+#             num_declines = sum(num_declines),
+#             num_no_declines = sum(num_no_declines)) %>% 
+#   ungroup() %>% 
+#   left_join(coincident_inclines_summary, by = c("food_group", "num_declines")) %>% 
+#   select(-num_coincident_inclines_same_group) %>% 
+#   mutate(prop_declines = num_declines/(num_declines+num_no_declines),
+#          total_ts = num_declines + num_no_declines) %>% 
+#   mutate(food_group = fct_reorder(food_group, prop_declines)) %>% 
+#   mutate(declines = num_declines) %>% # Duplicating column here to use later with ggtext()
+#     mutate(num_declines = num_declines-num_coincident_inclines_diff_group) %>% 
+#   pivot_longer(cols = starts_with("num"), names_to = "metric", values_to = "n") %>% 
+#   ggplot(aes(x = n, y = food_group, fill = factor(metric, levels = c("num_no_declines", "num_declines", "num_coincident_inclines_diff_group")))) + 
+#   geom_bar(position = "fill", stat = "identity", color = "black") +
+#   geom_text(aes(x = prop_declines + 0.01, y = food_group, label = paste0("n = ", declines)), hjust = 0) +
+#   annotate(geom = "text", x = 0.293 + 0.09, y = 11, label = "time series with declines", hjust = 0) +
+#   scale_fill_manual(values = c("num_no_declines" = "white", "num_declines" = "gray80", "num_coincident_inclines_diff_group" = "black"), 
+#                     labels = c("No decline\ndetected", "Decline without\ncoincident incline", "Decline with\ncoincident incline")) +
+#   labs(x = "Proportion of total time series",
+#        y = NULL,
+#        fill = NULL,
+#        title = "Coincident events across food groups") +
+#   cowplot::theme_minimal_hgrid() +
+#   theme(legend.position = "bottom", 
+#         axis.line = element_blank())
+# 
+# ggarrange(fig_num_declines, mag_x_dur_food_group, align = "hv")
+# ggpubr::ggarrange(fig_num_declines + theme(legend.position = "right"), mag_x_dur_food_group, heights = c(1, 1.5), ncol = 1, align = "h", labels = "AUTO")
+# 
+# 
+
+```
+
+### Incline frequency
+```{r}
+inclines %>% 
+  group_by(food_group) %>% 
+  summarize(n_inclines = n()) %>% 
+  left_join(n_ts_per_food_group) %>% 
+  adorn_totals() %>% 
+  mutate(incline_freq = n_inclines/n_ts)
+```
+
+
+## Map of declines per region
+
+Build world map highlighting the composition of declines per region.
+
+Prep geographic data:
+```{r}
+# Basemap
+world_map <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Get centroids of regions
+region_coords <- world_map %>% 
+  count(subregion) %>% 
+  mutate(lon = map_dbl(geometry, ~st_point_on_surface(.x)[[1]]),
+         lat = map_dbl(geometry, ~st_point_on_surface(.x)[[2]])) %>% 
+  mutate(lon = case_when(subregion == "South America" ~ lon-2,
+                         subregion == "Northern America" ~ lon-55, 
+                         TRUE ~ lon), # Adjust a few points to a better position
+         lat = case_when(subregion == "South America" ~ lat+5, 
+                         subregion == "Northern America" ~ lat-15,
+                         TRUE ~ lat))
+
+# Need to offset some of these points (where the pie charts will be) into the oceans for better visibility
+region_coords <- region_coords %>% 
+  mutate(
+    lon_offset = case_when(
+      subregion == "Western Europe" ~ -25,
+      subregion == "Southern Europe" ~ -15,
+      subregion == "Northern Europe" ~ -15,
+      subregion == "Central America" ~ -20,
+      subregion == "Caribbean" ~ 25,
+      subregion == "Melanesia" ~ 35,
+      subregion == "Micronesia" ~ 10,
+      subregion == "Western Asia" ~ 20,
+      subregion == "Western Africa" ~ -17,
+      subregion == "Middle Africa" ~ -13,
+      subregion == "Eastern Africa" ~ 5,
+      subregion == "South-Eastern Asia" ~ -17,
+      subregion == "Australia and New Zealand" ~ -45,
+      TRUE ~ 0),
+    lat_offset = case_when(
+      subregion == "Western Europe" ~ 10,
+      subregion == "Southern Europe" ~ -1,
+      subregion == "Northern Europe" ~ 5,
+      subregion == "Central America" ~ -2,
+      subregion == "Caribbean" ~ 5,
+      subregion == "Melanesia" ~ 0,
+      subregion == "Micronesia" ~ 25,
+      subregion == "Polynesia" ~ 20,
+      subregion == "Western Asia" ~ -20,
+      subregion == "Western Africa" ~ -20,
+      subregion == "Middle Africa" ~ -7,
+      subregion == "Southern Africa" ~ -25,
+      subregion == "South-Eastern Asia" ~ -17,
+      subregion == "Australia and New Zealand" ~ -15,
+      TRUE ~ 0)
+  )
+
+# Transform projection
+region_coords <- st_transform(region_coords, "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+
+# Get number of time series per food group and geographic region
+n_ts_per_food_group_and_region <- food_balance %>% 
+  filter(area_code < 5000) %>% # *CHECK* for other time series that were removed, e.g. Sudan
+  filter(element_code == 645) %>%  # Select supply only
+  filter(!item_code %in% unique(code_item_group$item_group_code)) %>% # Remove food item groups, keeping individual food items only
+  left_join(select(food_group_key, item_code, item_group, item_group_code, food_group, sector), by = "item_code") %>% # Join food group metadata
+  left_join(country_metadata[,c("geo_region_group", "identifier")], by = c("area_code" = "identifier")) %>% # Add country metadata
+  mutate(geo_region_group = if_else(area == "China", "Eastern Asia", geo_region_group)) %>% # Set China's data manually since there is a country number mismatch
+  group_by(food_group, geo_region_group) %>% 
+  summarize(n_ts = n_distinct(area_code, item_code))
+
+# n_ts_per_food_group_and_region %>% 
+#   group_by(geo_region_group) %>% 
+#   summarize(n_ts = sum(n_ts)) %>% view()
+
+# Normalize decline counts per food group and per geographic region by the number of time series, and generate overall decline frequency per region
+# Convert to wide format needed for scatterpie
+pie_data <- declines_unrecovered %>% 
+  count(geo_region_group, food_group, name = "n_declines") %>% 
+  left_join(n_ts_per_food_group_and_region, by = c("geo_region_group", "food_group")) %>% 
+  mutate(declines_norm = n_declines/n_ts) %>% 
+  group_by(geo_region_group) %>% 
+  mutate(tot_decline_freq = sum(n_declines)/sum(n_ts)) %>% 
+  arrange(desc(tot_decline_freq)) %T>%
+  print(n = Inf) %>%  
+  select(-starts_with("n")) %>% 
+  pivot_wider(names_from = food_group, values_from = declines_norm, values_fill = list(declines_norm = 0)) %>% 
+  mutate(symbol = case_when(geo_region_group == "Polynesia" ~ "*", # Add symbols to annotate on map for invisible island regions
+                            geo_region_group == "Micronesia" ~ "+",
+                            TRUE ~ "a")) %>% 
+  left_join(region_coords[,c("lon", "lon_offset", "lat", "lat_offset", "subregion")], by = c("geo_region_group" = "subregion")) # Join geo data
+```
+
+Build map.
+```{r}
+# Dissolve country polygons by region
+world_map_dissolved <- world_map %>% 
+  st_set_precision(100) %>% 
+  group_by(subregion) %>% 
+  summarize() 
+
+# Function to label scatterpie legend
+exp <- 100
+
+pie_legend_labels <- function(x) {
+  scales::number(x/exp, accuracy = 0.01)
+}
+
+# Plot
+
+# Define vector for ordering food groups in the legend
+food_group_order <- c("Starchy roots", "Cereals and pulses", "Fruits and vegetables", 
+                      "Vegetable oils and oilcrops", "Sugar and sugar crops", "Alcoholic beverages",
+                      "Meat and offals", "Milk, eggs, and animal fats","Seafood", 
+                      "Other")
+
+
+# Build custom color palette for the pie charts
+
+cols <- c("#226060FF", "#F1C332FF","#411F6BFF") # This is virids-like
+#cols <- c("#226060FF", "#FBA724FF","#411F6BFF")
+
+#cols <- viridis::viridis(3)[order(c(3,1,2))]
+
+map_pal <- c(cols[1], colorspace::lighten(cols[1], 0.3), colorspace::lighten(cols[1], 0.6), # Starchy roots, cereals, fruits/veg
+                cols[2], colorspace::lighten(cols[2], 0.3), colorspace::lighten(cols[2], 0.6), # Oils, sugar, beverages
+                cols[3], colorspace::lighten(cols[3], 0.3), colorspace::lighten(cols[3], 0.6), # Meat, seafood
+                "gray60") # Other
+
+scales::show_col(map_pal)
+
+(map <- ggplot() +
+    # Regions
+    geom_sf(data = world_map_dissolved, 
+            color = "white", 
+            fill = if_else(world_map_dissolved$subregion %in% pie_data$geo_region_group, "gray25", "gray85"), 
+            size = 0.25) +
+    # geom_bracket(xmin = 110, 
+    #              xmax = 180, 
+    #              y.position = -50,
+    #              label = "Test label") +
+    # Line segments connecting pie charts to regions
+    geom_segment(data = pie_data, 
+                 aes(x = lon, xend = lon + lon_offset, y = lat, yend = lat + lat_offset)) +
+    geom_point(data = pie_data, 
+               aes(x = lon, y = lat), 
+               size = 2) +
+    # Testing out labels for Micronesia and Polynesia
+    # geom_text(data = pie_data, aes(x = lon - lon_offset*0.1, y = lat - lat_offset*0.1, label = symbol), size = 3) +
+    # Pie charts
+    geom_scatterpie(data = pie_data, 
+                    aes(x = lon + lon_offset, y = lat + lat_offset, group = geo_region_group, r = tot_decline_freq*exp), 
+                    size = 0.1, 
+                    color = "white", 
+                    cols = names(pie_data)[match(food_group_order, names(pie_data))]) +
+    scale_fill_manual(values = map_pal, 
+                      breaks = names(pie_data)[match(food_group_order, names(pie_data))],
+                      guide = guide_legend(ncol = 4)
+                      ) +
+    # Legend
+    geom_scatterpie_legend(pie_data$tot_decline_freq*exp, x = -155, y = -55, n = 3, labeller = pie_legend_labels) +
+    # Legend title
+    annotate(x = -120, y = -25, geom = "text", label = "Decline frequency") +
+    # Legend/axes titles  
+    labs(x = NULL,
+         y = NULL,
+         fill = NULL,
+         NULL) +
+    # Themes
+    theme_void(base_size = 14) +
+    theme(legend.position = "bottom") +
+    NULL
+)
+```
+
+Other panel on income groups:
+```{r}
+# Get number of time series per food group and income class
+n_ts_per_food_group_and_income_class <- food_balance %>% 
+  filter(element_code == 645) %>%  # Select supply only
+  left_join(select(food_group_key, item_code, item_group, item_group_code, food_group, sector), by = "item_code") %>% # Join food group metadata
+  left_join(country_metadata[,c("eco_class_group", "identifier")], by = c("area_code" = "identifier")) %>% # Add country metadata
+  mutate(eco_class_group = if_else(area == "China", "Other developing countries or areas", eco_class_group)) %>% # Set China's data manually since there is a country number mismatch
+  group_by(food_group, eco_class_group) %>% 
+  summarize(n_ts = n_distinct(area_code, item_code)) %>% 
+  ungroup() %>% 
+  mutate(eco_class_group = case_when(eco_class_group == "Developed countries or areas" ~ "High Income",
+                                     eco_class_group == "Least Developed Countries" ~ "Low Income",
+                                     eco_class_group == "Other developing countries or areas" ~ "Middle Income"),
+         eco_class_group = fct_relevel(eco_class_group, "Low Income", after = Inf))
+
+(map_panel_b <- declines_unrecovered %>% 
+    count(eco_class_group, food_group, name = "n_declines") %>% 
+    left_join(n_ts_per_food_group_and_income_class, by = c("eco_class_group", "food_group")) %>% 
+    mutate(declines_norm = n_declines/n_ts) %>% 
+    
+    ggplot(aes(x = declines_norm, 
+               y = recode_factor(eco_class_group, 
+                                 "Least Developed Countries" = "Low Income",
+                                 "Other developing countries or areas" = "Middle Income",
+                                 "Developed countries or areas" = "High Income"),
+               fill = factor(food_group, levels = names(pie_data)[match(food_group_order, names(pie_data))]))) +
+    geom_col(position = position_fill(reverse = TRUE)) +
+    scale_fill_manual(values = map_pal,
+                      guide = guide_legend(ncol = 4)) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       labels = scales::percent_format()) +
+    labs(x = "Percentage of declines",
+         y = NULL,
+         fill = NULL) +
+    cowplot::theme_cowplot() +
+    theme(legend.position = "bottom",
+          plot.margin = unit(c(7,17,7,7), "pt")) # Expanding right-hand margin
+)
+
+# library(patchwork)
+# map + theme(legend.position = "none") + 
+#   map_panel_b & 
+#   plot_layout(nrow = 2, heights = c(1,0.5)) &
+#   plot_annotation(tag_levels = "a") &
+#   theme(plot.tag = element_text(face = "bold"))
+# 
+# or
+ggpubr::ggarrange(map + theme(legend.position = "none"),
+                  map_panel_b, 
+                  ncol = 1, 
+                  heights = c(1, 0.5),
+                  #align = "v",
+                  labels = "auto")
+
+
+ggsave(here("output", "figs", "declines_ms", "fig_map_and_income_class.png"), height = 9, width = 12, dpi = 300)
+
+
+# # Test out radial bar chart
+# pie_data %>% 
+#   select(-declines_total, -lon, -lat, -lon_offset, -lat_offset, -geometry) %>%
+#   pivot_longer(cols = `All others`:`Vegetable oils and oilcrops`, names_to = "food_group", values_to = "declines_food_grp") %>% 
+#   left_join(country_metadata[,c("eco_class_group", "geo_region_group", "continent_group", "identifier")], by = "geo_region_group") %>%
+#   mutate(eco_class_group = if_else(area == "China", "Other developing countries or areas", eco_class_group)) %>% # Set China's data manually since there is a country number mismatch
+#   ggplot(aes(x = geo_region_group, y = declines_food_grp, fill = food_group)) +
+#   geom_col() +
+#   coord_polar()
+# 
+# ts_summary %>% 
+#   left_join(country_metadata[,c("eco_class_group", "geo_region_group", "continent_group", "identifier")], by = c("area_code" = "identifier")) %>%
+#   mutate(eco_class_group = if_else(area == "China", "Other developing countries or areas", eco_class_group)) %>% # Set China's data manually since there is a country number mismatch
+#     mutate(eco_class_group = case_when(eco_class_group == "Developed countries or areas" ~ "High Income",
+#                                      eco_class_group == "Least Developed Countries" ~ "Low Income",
+#                                      eco_class_group == "Other developing countries or areas" ~ "Middle Income"),
+#          eco_class_group = fct_relevel(eco_class_group, "Low Income", after = Inf)) %>% 
+#   group_by(eco_class_group, geo_region_group, food_group) %>% 
+#   summarize(across(starts_with("num"), sum)) %>% 
+#   ggplot(aes(x = as.factor(interaction(geo_region_group, eco_class_group)), y = num_ts_w_declines/num_ts, fill = food_group)) +
+#   geom_col() +
+#   coord_polar()
+```
+
+## Decline recovery
+
+```{r}
+# What proportion of declines recovered to each threshold?
+select(declines, decline_id, starts_with("recovery")) %>% 
+  pivot_longer(cols = starts_with("recovery"), names_to = "recovery_thresh", values_to = "recovery") %>% 
+  count(recovery_thresh, recovery) %>% 
+  group_by(recovery_thresh) %>% 
+  mutate(freq = n/sum(n))
+
+# Set sizes
+size_line = 0.75
+size_point = 2.25
+
+# Plot threshold curve:
+select(declines, decline_id, starts_with("recovery")) %>% 
+  pivot_longer(cols = starts_with("recovery"), names_to = "recovery_thresh", values_to = "recovery") %>% 
+  mutate(recovery_thresh = parse_number(recovery_thresh)) %>% 
+  count(recovery_thresh, recovery) %>% 
+  group_by(recovery_thresh) %>% 
+  mutate(freq = n/sum(n)) %>% 
+  filter(recovery == 1) %>% 
+    
+  ggplot(aes(x = recovery_thresh, y = freq)) +
+  geom_point(size = size_point, color = paletteer_d(pal)[2]) +
+  geom_line(size = size_line, color = paletteer_d(pal)[2]) +
+  labs(x = "Recovery threshold",
+       y = "Percentage of declines recovered") +
+  cowplot::theme_half_open() +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(0, 0.3), breaks = seq(0, 0.3, by = 0.05), labels = scales::percent_format(accuracy = 1))
+
+ggsave(here("output", "figs", "declines_ms", "fig_recovery_sensitivity.png"), height = 4, width = 8, dpi = 300)
+```
+
+## Decline magnitude
+
+```{r}
+(magnitude_plot <- ggplot(data = declines_unrecovered, aes(x = abs(prop_change), y = factor(food_group, levels = rev(food_group_order)), color = food_group)) +
+  # geom_violin(size = 1.1, width = 1.1) +
+  # geom_boxplot(size = 1.1, width = 0.3) +
+  stat_halfeye(fill = "gray90") +
+  facet_wrap(~eco_class_group) +
+  labs(x = "Magnitude (percentage lost)",
+       y = NULL,
+       color = NULL) +
+  scale_color_manual(values = map_pal, 
+                     breaks = food_group_order) +
+  scale_fill_manual(values = str_replace(map_pal, "FF$", "50"), 
+                    breaks = food_group_order) +
+  scale_x_continuous(labels = scales::percent, 
+                     expand = expansion(mult = c(0, 0))) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+)
+
+(abs_magnitude_plot <- ggplot(data = declines_unrecovered, aes(x = abs(abs_change), y = factor(food_group, levels = rev(food_group_order)), color = food_group)) +
+  # geom_violin(size = 1.1, width = 1.1) +
+  # geom_boxplot(size = 1.1, width = 0.3) +
+  stat_halfeye(fill = "gray90") +
+  facet_wrap(~eco_class_group) +
+  labs(x = "Magnitude (kg per capita per year lost)",
+       y = NULL,
+       color = NULL) +
+  scale_color_manual(values = map_pal, 
+                     breaks = food_group_order) +
+  scale_fill_manual(values = str_replace(map_pal, "FF$", "50"), 
+                    breaks = food_group_order) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+)
+
+ggsave(here("output", "figs", "declines_ms", "fig_magnitude.png"), height = 6, width = 9, dpi = 300)
+
+# Looking at starchy roots in low/middle income countries vs. ASF in high income countries
+declines_unrecovered %>% 
+  filter(eco_class_group == "High Income",
+         (sector == "Meat, eggs, dairy" | sector == "Seafood")) %>% 
+  summarize(mean_magnitude = median(prop_change))
+
+declines_unrecovered %>% 
+  filter((eco_class_group == "Low Income" | eco_class_group == "Middle Income"),
+         sector == "Crops") %>% 
+  summarize(mean_magnitude = median(prop_change))
+
+declines_unrecovered %>% 
+  filter((eco_class_group == "Low Income" | eco_class_group == "Middle Income"),
+         food_group == "Starchy roots") %>% 
+  summarize(mean_magnitude = median(prop_change))
+
+declines_unrecovered %>% 
+  filter(eco_class_group == "Middle Income",
+         food_group == "Starchy roots") %>% 
+  summarize(mean_magnitude = median(prop_change))
+
+declines_unrecovered %>% 
+  filter(eco_class_group == "High Income",
+         (sector == "Meat, eggs, dairy" | sector == "Seafood")) %>% 
+  summarize(mean_magnitude = median(abs_change))
+
+declines_unrecovered %>% 
+  filter((eco_class_group == "Low Income" | eco_class_group == "Middle Income"),
+         sector == "Crops") %>% 
+  summarize(mean_magnitude = median(abs_change))
+
+
+declines_unrecovered %>% 
+  group_by(sector) %>% 
+  summarize(mean_prop_change = mean(prop_change))
+
+declines_unrecovered %>% 
+  group_by(eco_class_group) %>% 
+  summarize(mean_prop_change = mean(prop_change))
+
+declines_unrecovered %>% 
+  group_by(sector, eco_class_group) %>% 
+  summarize(mean_prop_change = mean(prop_change))
+
+declines_unrecovered %>% 
+  mutate(group = case_when(food_group == "Starchy roots" ~ "Roots",
+                           sector == "Meat, eggs, dairy" ~ "Meat, eggs, dairy",
+                           TRUE ~ NA_character_)) %>% 
+  drop_na(group) %>% 
+  group_by(group, eco_class_group) %>% 
+  summarize(mean_prop_change = mean(prop_change))
+
+(duration_plot <- ggplot(data = declines_unrecovered, aes(x = duration, y = factor(food_group, levels = rev(food_group_order)), color = food_group)) +
+  # geom_violin(size = 1.1, width = 1.1) +
+  # geom_boxplot(size = 1.1, width = 0.3) +
+  stat_halfeye(fill = "gray90") +
+  labs(x = "Duration (y)",
+       y = NULL,
+       color = NULL) +
+  scale_color_manual(values = map_pal, 
+                     breaks = food_group_order) +
+  scale_fill_manual(values = str_replace(map_pal, "FF$", "50"), 
+                    breaks = food_group_order) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "none")
+)
+
+ggarrange(magnitude_plot, 
+          abs_magnitude_plot,
+          labels = "auto",
+          nrow = 2)
+
+ggarrange(magnitude_plot, 
+          duration_plot + ylab("") + theme(axis.text.y = element_blank()), 
+          labels = "auto",
+          nrow = 1,
+          widths = c(1.5, 1))
+
+ggsave(here("output", "figs", "declines_ms", "fig_magnitude_duration.png"), height = 6, width = 9, dpi = 300)
+
+# Not plotting duration, but pull the numbers
+summary(declines_unrecovered$duration)
+hist(declines_unrecovered$duration)
+```
+
+
+## Coincident event time series
+
+```{r}
+# How many inclines were paired with a decline?
+coincident_events %>% 
+  distinct(incline_id_incline) %>% 
+  nrow()
+
+# What percentage of inclines is that?
+coincident_events %>% 
+  distinct(incline_id_incline) %>% 
+  nrow() / nrow(inclines)
+
+# What proportion of coincident events were in the same food group vs not?
+coincident_events %>% 
+  count(same_food_group) %>% 
+  mutate(prop = n/sum(n))
+
+# What proportion of declines had a same-group coincident incline?
+coincident_events %>% 
+  filter(same_food_group == TRUE) %>% 
+  distinct(decline_id) %>% 
+  nrow() / nrow(declines_unrecovered)
+```
+
+How many paired/coincident events had the incline event precede the decline? 
+```{r}
+coincident_events %>% 
+  mutate(paired_event_order = case_when(start_incline < start ~ "incline_preceded",
+                                        start_incline == start ~ "simultaneous",
+                                        start_incline > start ~ "incline_followed",
+                                        TRUE ~ NA_character_)) %>% 
+  count(paired_event_order) %>% 
+  mutate(prop = n/sum(n))
+
+# Is the high amount of paired events with the same start date because those events start in 1961, the start of the food supply time series?
+(a <- coincident_events %>% 
+  mutate(paired_event_order = case_when(start_incline < start ~ "Incline event preceded decline",
+                                        start_incline == start ~ "Incline and decline events started simultaneously",
+                                        start_incline > start ~ "Incline event followed decline",
+                                        TRUE ~ NA_character_)) %>% 
+  ggplot(aes(x = start)) +
+  geom_bar(fill = paletteer::paletteer_d("beyonce::X6")[4]) +
+  facet_wrap(~paired_event_order, ncol = 1) +
+  labs(x = "First year of decline event",
+       y = "Number of declines") +
+  cowplot::theme_half_open() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+)
+
+# How does this break down by food group?
+(b <- coincident_events %>% 
+    mutate(paired_event_order = case_when(start_incline < start ~ "Incline event preceded decline",
+                                          start_incline == start ~ "Incline and decline events started simultaneously",
+                                          start_incline > start ~ "Incline event followed decline",
+                                          TRUE ~ NA_character_)) %>% 
+    count(paired_event_order, food_group) %>% 
+    bind_rows( # Add totals for plotting
+      coincident_events %>% 
+        mutate(paired_event_order = case_when(start_incline < start ~ "Incline event preceded decline",
+                                              start_incline == start ~ "Incline and decline events started simultaneously",
+                                              start_incline > start ~ "Incline event followed decline",
+                                              TRUE ~ NA_character_)) %>% 
+        count(paired_event_order) %>% 
+        mutate(food_group = "Total")
+    ) %>% 
+    ggplot(aes(y = factor(food_group, levels = rev(c(food_group_order, "Total"))), x = n, fill = paired_event_order)) +
+    geom_col(position = "fill") +
+    labs(x = "Percentage of coinciding events",
+         y = "Decline event food group",
+         fill = NULL) +
+    scale_fill_paletteer_d("beyonce::X6") +
+    scale_x_continuous(expand = expansion(mult = c(0, 0)),
+                       labels = scales::percent_format()) +
+    cowplot::theme_half_open() +
+    theme(legend.position = "bottom",
+          plot.margin = unit(c(7,17,7,7), "pt")) + # Expanding right-hand margin
+    guides(fill = guide_legend(ncol = 1))
+)
+
+ggarrange(b, a, labels = "auto", widths = c(1, 0.6))
+ggsave(here("output", "figs", "declines_ms", "fig_coincident_events_si.png"), height = 4, width = 8, scale = 1.5, dpi = 300)
+```
+
+SI: Visualize what food groups were paired with which:
+```{r}
+food_group_order <- c("Starchy roots", "Cereals and pulses", "Fruits and vegetables", 
+                      "Vegetable oils and oilcrops", "Sugar and sugar crops", "Alcoholic beverages",
+                      "Meat and offals", "Milk, eggs, and animal fats", "Seafood", 
+                      "Other")
+
+# Heatmap displaying # of paired events for each combination of food group
+coincident_events %>% 
+  select(food_group, food_group_incline) %>% 
+  count(food_group, food_group_incline) %>% 
+
+  ggplot(aes(x = factor(food_group, levels = food_group_order), 
+             y = factor(food_group_incline, levels = food_group_order))) +
+  geom_tile(aes(fill = n)) +
+  labs(x = "Decline food group",
+       y = "Incline food group",
+       fill = "Number of\npaired events") +
+  scale_fill_paletteer_c("viridis::plasma") +
+  scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0))) +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here("output", "figs", "declines_ms", "fig_coincident_events_combos_si.png"), height = 7, width = 9, units = "in", dpi = 600)
+```
+
+Unfinished
+```{r}
+# Plot all coincident event time series!
+
+food_supply <- food_balance %>% 
+  filter(element_code == 645) %>% 
+  filter(item_code %in% coincident_inclines$item_code | item_code %in% coincident_inclines$item_code_incline)
+
+str(coincident_inclines)
+
+plots <- list()
+for(i in seq_len(nrow(coincident_inclines))) {
+  dat <- ts_w_declines_df %>% 
+    filter(area_code == coincident_inclines$area_code[i], 
+           item_code == coincident_inclines$item_code[i]) %>% 
+            mutate(event_id = if_else(event_id == coincident_inclines$event_id[i], paste0("decline_", event_id), NA_character_)) %>% # If there is more than one event in the time series, select only the paired event
+    bind_rows(
+      ts_w_inclines_df %>% 
+        filter(area_code == coincident_inclines$area_code[i],
+               item_code == coincident_inclines$item_code_incline[i]) %>% 
+        mutate(event_id = if_else(event_id == coincident_inclines$event_id_incline[i], paste0("incline_", event_id), NA_character_)) # If there is more than one event in the time series, select only the paired event 
+    )
+  
+  plots[[i]] <- ggplot(data = dat, aes(x = year, y = quantity, color = item)) +
+    geom_point() +
+    geom_line() +
+    geom_line(data = . %>% filter(!is.na(event_id)), aes(color = item, group = item), size = 4, alpha = 0.25, show.legend = FALSE) + # Highlight the event years
+    labs(title = dat$area,
+         subtitle = paste0(coincident_inclines$item[i], ": loss of ", round(coincident_inclines$abs_change[i]), " kg capita/yr (", scales::percent(coincident_inclines$prop_change[i], accuracy = 1), ")\n",
+                           coincident_inclines$item_incline[i], ": gain of ", round(coincident_inclines$abs_change_incline[i]), " kg capita/yr (", scales::percent(coincident_inclines$prop_change_incline[i], accuracy = 1), ")"),
+         y = "Supply quantity (kg capita/yr)",
+         x = "Year",
+         color = NULL) +
+    scale_x_continuous(breaks = seq(1960, 2010, by = 10)) +
+    cowplot::theme_half_open() +
+    theme(legend.position = "top")
+}
+
+pdf(here("output", "figs", paste0("food_supply_coincident_events_", Sys.Date(), ".pdf")), height = 11, width = 8.5)
+ggarrange(plotlist = plots, ncol = 1, nrow = 3, align = "v")
+dev.off()
+```

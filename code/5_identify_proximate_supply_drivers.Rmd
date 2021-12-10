@@ -1,0 +1,805 @@
+---
+title: "Identify proximate drivers of food supply declines"
+author: "Danielle Ferraro"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Overview
+
+1) Perform Spearman's rank correlations on supply and the components of supply (production, imports, exports, etc) to identify which component was the proximate driver (i.e., dominant correlate) of supply during declines. 
+
+2) Identify if, during production-associated supply declines, there were also declines in absolute production, harvestable area, or yield.
+
+# Setup
+
+Load packages.
+```{r}
+library(here)
+library(tidyverse)
+library(janitor)
+library(vroom)
+library(ggpubr)
+library(paletteer)
+library(patchwork)
+library(broom)
+```
+
+Set directories.
+```{r}
+source(here("src", "directories.R"))
+```
+
+# Load data 
+
+```{r}
+# Tidy food balance data
+food_balance <- vroom(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy_filtered.csv"), delim = ",", locale = locale(encoding = "latin1"))
+
+# Raw harvestable area/yield, from FAO crops dataset
+crops <- vroom(file.path(dir_raw_data, "FAO", "crops_livestock", "Production_Crops_Livestock_E_All_Data_(Normalized).csv"), delim = ",", locale = locale(encoding = "latin1")) %>% 
+  clean_names()
+
+# Key to map FBS items to crops items
+fbs_to_crops_key <- vroom(file.path(dir_raw_data, "FAO", "crops_livestock", "MapSPAM_to_FAO_v2.csv"), delim = ",", locale = locale(encoding = "latin1"))
+
+# Food supply declines list
+declines <- read_csv(file.path(dir_data_bottlenecks, "declines", "characterized_declines_2021-08-13.csv"))
+
+# Coincident events list
+coincident_events <- read_csv(file.path(dir_data_bottlenecks, "declines", "declines_w_coincident_inclines.csv"))
+
+# Time series with food supply declines
+ts_w_declines <- read_csv(file.path(dir_data_bottlenecks, "declines", "ts_w_declines_2021-08-13.csv"))
+```
+
+# Prep data
+
+Subset necessary data:  
+* 511 - population
+* 5511- production
+* 5611 - import quantity
+* 5911 - export quantity
+* 645 - food supply
+* 5301 - total supply
+* 5521 - feed  
+* 5527 - seed
+* 5072 - stock variation
+and harmonize units.
+```{r}
+distinct(food_balance, element, element_code, unit)
+
+food_balance_per_cap <- food_balance %>% 
+  
+  # Select necessary components of supply
+  filter(element_code %in% c(511, 5511, 5611, 5911, 645, 5301, 5521, 5527, 5072)) %>% 
+  mutate(quantity = case_when(unit == "1000 tonnes" ~ quantity*1000*1000, # Convert all quantities to kg
+                              unit == "1000 persons" ~ quantity*1000, # Multiply population by the unit scaling factor
+                              TRUE ~ quantity)) %>% 
+  
+  # Convert production, imports, exports, and total supply to per capita quantities (food supply is already per capita)
+  group_by(area_code, area, year) %>% 
+  mutate(quantity = if_else(item == "Population" | element_code == 645, 
+                            quantity,
+                            quantity/quantity[item == "Population"])) %>% 
+  ungroup() %>% 
+  
+  # Convert to wide format for correlation
+  filter(item != "Population") %>% 
+  select(-element_code, -unit) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  
+  # Clean up column names
+  clean_names() %>% 
+  rename(prod_per_cap = production,
+         import_per_cap = import_quantity,
+         export_per_cap = export_quantity,
+         food_supply_per_cap = food_supply_quantity_kg_capita_yr,
+         feed_per_cap = feed,
+         seed_per_cap = seed,
+         stock_var_per_cap = stock_variation,
+         total_supply_per_cap = domestic_supply_quantity) %>% 
+  
+  # Filter to only the years within decline events
+  right_join(
+    ts_w_declines %>% 
+      filter(!is.na(decline_id)) %>%
+      rename(food_supply_per_cap = quantity)
+    ) %>% # nrow = 30509
+
+  select(decline_id, year, ends_with("per_cap")) %>% 
+  arrange(decline_id, year) 
+```
+
+# Explore missing data
+
+Though supply is a derived variable, not all supply declines have associated production/imports/exports/etc time series. Some data is completely missing, while other time series are made up of all zeroes. Taking a peek at how much data is missing...
+
+```{r}
+food_balance_per_cap %>% 
+  group_by(decline_id) %>% 
+  naniar::miss_var_summary()
+
+missing_summary <- ts_w_declines %>% 
+  filter(!is.na(decline_id)) %>%
+  rename(supply_per_cap = quantity) %>%
+  left_join(food_balance_per_cap) %>% 
+  select(decline_id, supply_per_cap, prod_per_cap, export_per_cap, import_per_cap, seed_per_cap, feed_per_cap) %>%
+  group_by(decline_id) %>% 
+  naniar::miss_var_summary() %>% 
+  mutate(na = if_else(pct_miss == 100, TRUE, FALSE)) %>% 
+  ungroup()
+
+missing_summary %>% 
+  filter(na == TRUE) %>% 
+  count(variable) %>% 
+  mutate(prop = n/nrow(declines)) %>% 
+  arrange(desc(prop))
+```
+
+# Plot supply/supply element time series
+
+Warning: takes a few minutes to run.
+```{r, eval = FALSE}
+supply_component_ts_plots <- ts_w_declines %>% 
+  filter(!is.na(decline_id)) %>%
+  rename(supply_per_cap = quantity) %>%
+  left_join(food_balance_per_cap) %>% 
+  pivot_longer(c("supply_per_cap",
+                 "prod_per_cap",
+                 "export_per_cap",
+                 "import_per_cap",
+                 "seed_per_cap",
+                 "feed_per_cap"), names_to = "supply_element", values_to = "quantity") %>% 
+  group_split(decline_id) %>% 
+  map(
+    ~ggplot(., aes(x = year, y = quantity, color = supply_element, group = supply_element)) +
+      geom_point() +
+      geom_line() +
+      labs(x = NULL,
+           y = "Quantity (kg/capita/yr)",
+           color = "Supply element",
+           title = paste0(.$area, ": Decline in ", .$item),
+           subtitle = paste0("Decline ID#: ", .$decline_id)) +
+      cowplot::theme_half_open()
+  )
+
+pdf(here("output", "figs", "supply_component_time_series.pdf"), height = 11, width = 8.5)
+ggarrange(plotlist = supply_component_ts_plots, ncol = 1, nrow = 3, align = "v")
+dev.off()
+```
+
+# Calculate ratio of food supply to total supply
+
+Should be close to 1
+
+```{r}
+(food_supply_vs_total_supply <- food_balance_per_cap %>% 
+   mutate(ratio = food_supply_per_cap/total_supply_per_cap) %>% # NAs, NaNs, Infs...
+   group_by(decline_id) %>% 
+   summarize(across(where(is.numeric), mean))
+)
+
+summary(food_supply_vs_total_supply$ratio)
+plot(density(na.omit(food_supply_vs_total_supply$ratio)))
+plot(food_supply_vs_total_supply$food_supply_per_cap, food_supply_vs_total_supply$total_supply_per_cap, cex = 0.3)
+abline(a = 0, b = 1)
+
+summary(na.omit(food_supply_vs_total_supply$ratio))
+```
+
+# Correlations
+
+```{r}
+# Append per cap trade data to supply time series (for years within a decline event only) and convert to list
+food_balance_per_cap_list <- food_balance_per_cap %>% 
+  group_split(decline_id, .keep = FALSE) %>% # The list element index lines up with the decline_id here, but I should write something to ensure this
+  map(~column_to_rownames(., "year"))
+
+# Spearman's function
+compute_trade_correlations <- function(x_df){
+  cor.matrix <- cor(x_df, method = "spearman", use = "pairwise.complete.obs")
+  cor.matrix["food_supply_per_cap", 
+             !(colnames(cor.matrix) == "food_supply_per_cap")]
+  }
+
+# Map correlation function over each country-item ts and put results into data frame
+cor_results <- map(food_balance_per_cap_list, compute_trade_correlations) %>% 
+  bind_rows(.id = "decline_id") %>%  # Map list element number to a new column
+  mutate(decline_id = as.integer(decline_id))
+
+# Identify dominant correlate(s) per decline, i.e., the supply component(s) with abs(rho) >= 0.9, else the component(s) with max(rho).
+# We decided to remove seed, feed, and stock variation from the analysis to focus only on production and trade
+
+rho_thresh <- 0.9
+
+main_correlates <- cor_results %>% 
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Unrecovered declines only
+  # drop_na(ends_with("per_cap")) %>% # Remove declines that have no rho value for ANY correlate (this is due to missing data) -- decided against this, very few have complete data
+  select(-total_supply_per_cap,
+         -feed_per_cap,
+         -seed_per_cap, # Seed positively correlated with food supply
+         -stock_var_per_cap) %>% # Stock variation very weakly correlated to supply 
+  pivot_longer(cols = ends_with("per_cap"), names_to = "element", values_to = "rho") %>% 
+  mutate(rho = abs(rho)) %>% # Take absolute value of rho
+  group_by(decline_id) %>% 
+  summarize(dominant_correlate = if_else(max(na.omit(rho)) >= rho_thresh, 
+                                         paste(element[which(rho >= rho_thresh)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", "))) %>%
+  mutate(dominant_correlate = if_else(dominant_correlate == "", NA_character_, dominant_correlate)) %>% 
+  ungroup() %>% 
+  left_join(select(declines, decline_id, area, area_code, item, item_code, food_group, sector), by = "decline_id") # Rejoin food data
+
+# How many declines had no dominant correlate? (because of missing data or 0 data)
+main_correlates %>%
+  filter(is.na(dominant_correlate)) # n = 25
+
+# Explore results
+
+filter(main_correlates, is.na(dominant_correlate))
+sort(table(main_correlates$dominant_correlate), decreasing = TRUE)
+sort(prop.table(table(main_correlates$dominant_correlate)), decreasing = TRUE)
+filter(main_correlates, str_detect(dominant_correlate, "feed_per_cap")) %>% arrange(sector) %>% View()
+
+# Is seed positively correlated most of the time?
+hist(cor_results$seed_per_cap) # Yes - will remove from analysis
+hist(cor_results$feed_per_cap) # Feed too
+```
+
+# Extract numbers 
+
+Pull numbers for use in manuscript.
+```{r}
+abs(cor_results) %>% 
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+  summary()
+
+abs(cor_results) %>% 
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+  pull(prod_per_cap) %>% 
+  density(na.rm = TRUE)
+
+main_correlates %>% 
+  drop_na(dominant_correlate) %>% # Remove the 25 declines with missing data first
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+  separate_rows(dominant_correlate, sep = ", ") %>% 
+  count(dominant_correlate) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  arrange(desc(prop))
+
+main_correlates %>% 
+  drop_na(dominant_correlate) %>% # Remove the 25 declines with missing data first
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+  separate_rows(dominant_correlate, sep = ", ") %>% 
+  count(food_group, dominant_correlate) %>% 
+  group_by(food_group) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  ungroup() %>% 
+  arrange(food_group, desc(prop)) %>% 
+  print(n = Inf)
+```
+
+
+# Plot correlation results
+
+## Density of Spearman's rho values across dominant correlates
+```{r}
+# pal <- "beyonce::X6"
+pal <- "beyonce::X1"
+
+(a <- abs(cor_results) %>% 
+    filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+    select(-total_supply_per_cap, -stock_var_per_cap, -seed_per_cap, -feed_per_cap) %>% 
+    pivot_longer(cols = where(is.double), names_to = "element", values_to = "rho") %>% 
+    
+    ggplot(aes(x = rho, fill = factor(element, levels = c("prod_per_cap", "import_per_cap", "export_per_cap")), color = factor(element, levels = c("prod_per_cap", "import_per_cap", "export_per_cap")))) +
+    geom_density(size = 1.25, alpha = 0.1) +
+    geom_vline(xintercept = 0.9, linetype = "dashed") +
+    scale_color_manual(values = c(paletteer_d(pal)[2:4]), 
+                       labels = c("export_per_cap" = "Exports", 
+                                  "import_per_cap" = "Imports",
+                                  "prod_per_cap" = "Production")) +
+    scale_fill_manual(values = c(paletteer_d(pal)[2:4]), 
+                      labels = c("export_per_cap" = "Exports", 
+                                 "import_per_cap" = "Imports",
+                                 "prod_per_cap" = "Production")) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0))) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+    labs(x = "Absolute value of Spearman's rho",
+         y = "Density",
+         color = bquote(Supply~element~(kg~capita^-1~yr^-1)),
+         fill = bquote(Supply~element~(kg~capita^-1~yr^-1))) +
+    cowplot::theme_half_open() +
+    theme(legend.position = c(0.03, 0.85))
+)
+```
+
+## Barplot of counts per dominant correlate
+```{r}
+(b <- main_correlates %>% 
+    filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+    drop_na(dominant_correlate) %>% 
+    separate_rows(dominant_correlate, sep = ", ") %>% 
+
+    ggplot(aes(x = fct_infreq(dominant_correlate), fill = fct_infreq(dominant_correlate))) +
+    geom_bar(aes(y = (..count..)/sum(..count..))) + # Plots proportions
+
+    labs(y = "Percentage of supply declines",
+         x = bquote(Dominant~correlate~(kg~capita^-1~yr^-1)),
+         fill = "Dominant correlate") +
+    scale_fill_manual(values = c(paletteer_d(pal)[2:5]),
+                      labels = c("export_per_cap" = "Exports",
+                                 "import_per_cap" = "Imports",
+                                 "prod_per_cap" = "Production")
+    ) +
+    scale_x_discrete(labels = c("export_per_cap" = "Exports",
+                                "import_per_cap" = "Imports",
+                                "prod_per_cap" = "Production"),
+                     expand = expansion(mult = c(0.17, 0.17))) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0))) +
+    cowplot::theme_half_open() +
+    theme(legend.position = c(0.55, 0.85), 
+          plot.margin = unit(c(7,17,7,7), "pt"))
+)
+```
+
+## Proportional barplot of dominant correlates per food group
+```{r}
+# Define vector for ordering food groups in the legend
+food_group_order <- c("Starchy roots", "Cereals and pulses", "Fruits and vegetables", 
+                      "Vegetable oils and oilcrops", "Sugar and sugar crops", "Alcoholic beverages",
+                      "Meat and offals", "Milk, eggs, and animal fats", "Seafood", 
+                      "Other")
+
+(c <- main_correlates %>% 
+    filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+    drop_na(dominant_correlate) %>% 
+    separate_rows(dominant_correlate, sep = ", ") %>% 
+
+    ggplot(aes(y = factor(food_group, levels = rev(food_group_order)), fill = fct_infreq(dominant_correlate))) +
+    geom_bar(position = position_fill(reverse = TRUE)) +
+    labs(x = "Percentage of supply declines",
+         y = NULL,
+         fill = bquote(Dominant~correlate~(kg~capita^-1~yr^-1))) +
+    scale_fill_manual(values = paletteer_d(pal)[2:5],
+                           labels = c("export_per_cap" = "Exports",
+                                      "import_per_cap" = "Imports",
+                                      "prod_per_cap" = "Production",
+                                      "feed_per_cap" = "Feed",
+                                      "seed_per_cap" = "Seed")) +
+    scale_x_continuous(label = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0))) +
+    cowplot::theme_half_open() +
+    theme(plot.margin = unit(c(7,17,7,7), "pt"))
+)
+
+# Version with icons!
+library(png) # For importing pngs
+library(grid) # For adding pngs to ggplot
+# Load icons, and set X position for plotting along the Y axis.
+apple <- rasterGrob(readPNG(here("output", "figs", "icons", "apple_black.png")))
+sugarcane <- rasterGrob(readPNG(here("output", "figs", "icons", "sugarcane_black.png")))
+beer <- rasterGrob(readPNG(here("output", "figs", "icons", "beer_black.png")))
+milk <- rasterGrob(readPNG(here("output", "figs", "icons", "milk_black.png")))
+olivebranch <- rasterGrob(readPNG(here("output", "figs", "icons", "olivebranch_black.png")))
+grouper <- rasterGrob(readPNG(here("output", "figs", "icons", "grouper.png")))
+rice <- rasterGrob(readPNG(here("output", "figs", "icons", "rice.png")))
+cassava <- rasterGrob(readPNG(here("output", "figs", "icons", "cassava.png")))
+cow <- rasterGrob(readPNG(here("output", "figs", "icons", "cow.png")))
+
+icon_xmin <- -0.045
+icon_xmax <- -0.015
+
+(c_with_icons <- main_correlates %>% 
+    filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+    drop_na(dominant_correlate) %>% 
+    separate_rows(dominant_correlate, sep = ", ") %>% 
+
+    ggplot(aes(y = factor(food_group, levels = rev(food_group_order)), fill = fct_infreq(dominant_correlate))) +
+    geom_bar(position = position_fill(reverse = TRUE)) +
+    annotation_custom(grob = cassava, xmin = icon_xmin, xmax = icon_xmax, ymin = 9.6, ymax = 10.4) +
+    annotation_custom(grob = rice, xmin = icon_xmin, xmax = icon_xmax, ymin = 8.6, ymax = 9.4) +
+    annotation_custom(grob = apple, xmin = icon_xmin, xmax = icon_xmax, ymin = 7.75, ymax = 8.25) +
+    annotation_custom(grob = olivebranch, xmin = icon_xmin, xmax = icon_xmax, ymin = 6.5, ymax = 7.5) +
+    annotation_custom(grob = sugarcane, xmin = icon_xmin, xmax = icon_xmax, ymin = 5.5, ymax = 6.5) +
+    annotation_custom(grob = beer, xmin = icon_xmin, xmax = icon_xmax, ymin = 4.25, ymax = 5.75) +
+    annotation_custom(grob = cow, xmin = icon_xmin, xmax = icon_xmax, ymin = 3.75, ymax = 4.25) +
+    annotation_custom(grob = milk, xmin = icon_xmin, xmax = icon_xmax, ymin = 2.25, ymax = 3.75) +
+    annotation_custom(grob = grouper, xmin = icon_xmin, xmax = icon_xmax, ymin = 1.25, ymax = 2.75) +
+    coord_cartesian(clip = "off") +
+    labs(x = "Percentage of supply declines",
+         y = NULL,
+         fill = bquote(Dominant~correlate~(kg~capita^-1~yr^-1))) +
+    scale_fill_manual(values = paletteer_d(pal)[2:5],
+                           labels = c("export_per_cap" = "Exports",
+                                      "import_per_cap" = "Imports",
+                                      "prod_per_cap" = "Production",
+                                      "feed_per_cap" = "Feed",
+                                      "seed_per_cap" = "Seed")) +
+    scale_x_continuous(label = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0))) +
+    cowplot::theme_half_open() +
+    theme(plot.margin = unit(c(7,17,7,7), "pt"),
+          legend.position = "top",
+          axis.text.y = element_text(margin = margin(r = 25))) # Adding room for icons
+)
+
+# Put everything together:
+library(patchwork)
+a / (b + c + theme(legend.position = "none")) & plot_annotation(tag_levels = "a")
+ggsave(here("output", "figs", "declines_ms", "fig_correlation_results.png"), height = 6, width = 8, dpi = 600, scale = 1.2)
+
+# Option 2, with food group plot on its own row aligned to the full plot area
+library(cowplot)
+ggdraw() +
+  draw_plot(a, x = 0, y = .5, width = .5, height = .5) +
+  draw_plot(b, x = .5, y = .5, width = .5, height = .5) +
+  draw_plot(c_with_icons + theme(legend.position = "none"), x = 0, y = 0, width = 1, height = 0.5) +
+  draw_plot_label(label = c("a", "b", "c"), size = 15,
+                  x = c(0, 0.5, 0), y = c(1, 1, 0.5))
+ggsave(here("output", "figs", "declines_ms", "fig_correlation_results_v2.png"), height = 6.5, width = 8, dpi = 600, scale = 1.2)
+```
+
+## SI figure showing raw correlation coefficients
+
+```{r}
+cor_results %>% 
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+  select(-total_supply_per_cap, 
+         -stock_var_per_cap,
+         -feed_per_cap,
+         -seed_per_cap) %>% 
+  pivot_longer(cols = where(is.double), names_to = "element", values_to = "rho") %>% 
+  
+  ggplot(aes(x = rho, fill = factor(element, levels = c("prod_per_cap", "import_per_cap", "export_per_cap", "feed_per_cap", "seed_per_cap")), color = factor(element, levels = c("prod_per_cap", "import_per_cap", "export_per_cap", "feed_per_cap", "seed_per_cap")))) +
+  geom_density(size = 1.25, alpha = 0.1) +
+  scale_color_manual(values = c(paletteer_d(pal)[2:6]), 
+                     labels = c("export_per_cap" = "Exports", 
+                                "import_per_cap" = "Imports",
+                                "prod_per_cap" = "Production",
+                                "feed_per_cap" = "Feed",
+                                "seed_per_cap" = "Seed")) +
+  scale_fill_manual(values = c(paletteer_d(pal)[2:6]), 
+                    labels = c("export_per_cap" = "Exports", 
+                               "import_per_cap" = "Imports",
+                               "prod_per_cap" = "Production",
+                               "feed_per_cap" = "Feed",
+                               "seed_per_cap" = "Seed")) +
+  scale_x_continuous(breaks = seq(-1, 1, by = 0.25), expand = expansion(mult = c(0, 0))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  labs(x = "Spearman's rho",
+       y = "Density",
+       color = bquote(Supply~element~(kg~capita^-1~yr^-1)),
+       fill = bquote(Supply~element~(kg~capita^-1~yr^-1))) +
+  cowplot::theme_half_open() +
+  theme(legend.position = c(0.03, 0.85),
+        plot.margin = unit(c(7,17,7,7), "pt"))
+
+ggsave(here("output", "figs", "declines_ms", "fig_correlation_results_si.png"), height = 6, width = 10, dpi = 600)
+```
+
+## SI plot showing sensitivity of rho
+
+How sensitive are the dominant driver results to the choice of rho?
+
+```{r}
+main_correlates_sensitivity <- cor_results %>% 
+  filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Unrecovered declines only
+  # drop_na(ends_with("per_cap")) %>% # Remove declines that have no rho value for ANY correlate (this is due to missing data) -- decided against this, very few have complete data
+  select(-total_supply_per_cap,
+         -feed_per_cap,
+         -seed_per_cap, # Seed positively correlated with food supply
+         -stock_var_per_cap) %>% # Stock variation very weakly correlated to supply 
+  pivot_longer(cols = ends_with("per_cap"), names_to = "element", values_to = "rho") %>% 
+  mutate(rho = abs(rho)) %>% # Take absolute value of rho
+  group_by(decline_id) %>% 
+  summarize(dominant_correlate_0.9 = if_else(max(na.omit(rho)) >= 0.9, 
+                                         paste(element[which(rho >= 0.9)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", ")),
+            dominant_correlate_0.8 = if_else(max(na.omit(rho)) >= 0.8, 
+                                         paste(element[which(rho >= 0.8)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", ")),
+            dominant_correlate_0.7 = if_else(max(na.omit(rho)) >= 0.7, 
+                                         paste(element[which(rho >= 0.7)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", ")),
+            dominant_correlate_0.6 = if_else(max(na.omit(rho)) >= 0.6, 
+                                         paste(element[which(rho >= 0.6)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", ")),
+            dominant_correlate_0.5 = if_else(max(na.omit(rho)) >= 0.5, 
+                                         paste(element[which(rho >= 0.5)], collapse = ", "),
+                                         paste(element[which(rho == max(na.omit(rho)))], collapse = ", "))) %>%
+  mutate(across(starts_with("dominant_correlate_"), ~if_else(.x == "", NA_character_, .x))) %>% 
+  ungroup() %>% 
+  left_join(select(declines, decline_id, area, area_code, item, item_code, food_group, sector), by = "decline_id") # Rejoin food data
+
+main_correlates_sensitivity %>% 
+  na.omit() %>% 
+  pivot_longer(cols = starts_with("dominant_correlate_"), names_to = "rho_thresh", values_to = "dominant_correlate") %>% 
+  mutate(rho_thresh = parse_number(rho_thresh)) %>% 
+  separate_rows(dominant_correlate, sep = ", ") %>% 
+  count(rho_thresh, dominant_correlate) %>% 
+  mutate(prop = n/nrow(na.omit(main_correlates_sensitivity))) %>% 
+  
+  ggplot(aes(x = rho_thresh, fill = factor(dominant_correlate, levels = c("prod_per_cap", "import_per_cap", "export_per_cap")))) +
+  geom_col(aes(x = rho_thresh, y = prop), position = "dodge") + 
+  labs(y = "Percentage of supply declines",
+       x = "Spearman's rho threshold",
+       fill = "Dominant correlate") +
+  scale_fill_manual(values = c(paletteer_d(pal)[2:5]),
+                    labels = c("export_per_cap" = "Exports",
+                               "import_per_cap" = "Imports",
+                               "prod_per_cap" = "Production")
+  ) +
+  scale_x_continuous(breaks = c(0.5, 0.6, 0.7, 0.8, 0.9)) +
+  scale_y_continuous(limits = c(0, 0.8), 
+                     breaks = seq(0, 0.8, by = 0.1),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0))) +
+  cowplot::theme_half_open() +
+  theme(plot.margin = unit(c(7,17,7,7), "pt"),
+        legend.position = "top")
+
+ggsave(here("output", "figs", "declines_ms", "fig_correlation_sensitivity_si.png"), height = 6, width = 8, dpi = 600)
+```
+
+
+## Exploring set plots
+```{r}
+# # Set plots (Test out a few packages for making venn diagrams and upset plots)
+# venn_input <- main_correlates %>% 
+#   count(dominant_correlate) %>% 
+#   # mutate(dominant_correlate = case_when(dominant_correlate == "export_per_cap" ~ "Exports", 
+#   #                                       dominant_correlate == "import_per_cap" ~ "Imports", 
+#   #                                       dominant_correlate == "prod_per_cap" ~ "Production",
+#   #                                       dominant_correlate == "prod_per_cap, export_per_cap" ~ "Production, Exports",
+#   #                                       dominant_correlate == "prod_per_cap, import_per_cap" ~ "Production, Imports",
+#   #                                       dominant_correlate == "import_per_cap, export_per_cap" ~ "Imports, Exports",
+#   #                                       dominant_correlate == "prod_per_cap, import_per_cap, export_per_cap" ~ "Production, Imports, Exports",
+#   #                                       TRUE ~ dominant_correlate)) %>% 
+#   mutate(dominant_correlate = str_replace_all(dominant_correlate, ", ", "&")) %>% 
+#   deframe()
+# 
+# library(UpSetR)
+# (upset <- upset(fromExpression(venn_input), 
+#       order.by = "freq",
+#       mainbar.y.label = "Set size (# declines)", 
+#       sets.x.label = "Intersection size (# declines)",
+#       text.scale = 2)
+# )
+# 
+# png(here::here("output", "figs", "declines_ms", "fig_correlation_results_upset.png"), height = 5, width = 7, unit = "in", res = 300)
+# upset
+# dev.off()
+# 
+# library(eulerr)
+# (venn <- plot(euler(venn_input), 
+#      fills = paletteer_d(pal),
+#      alpha = 0.75,
+#      edges = FALSE,
+#      quantities = TRUE) # Missing some small sets
+# )
+# 
+# euler(venn_input) # A large amount of sets --> very imperfect solution
+# euler(venn_input, shape = "ellipse") # Fitting to ellipse doesn't help
+# 
+# 
+# png(here::here("output", "figs", "declines_ms", "fig_correlation_results_venn.png"), height = 5, width = 5, unit = "in", res = 300)
+# venn
+# dev.off()
+```
+
+# Investigate production-associated declines
+
+How many declines that were associated with per capita reduction in production experienced actual reductions in gross production?
+
+First, extract the production-associated declines:
+```{r}
+# Checking count
+# main_correlates %>% 
+#   filter(decline_id %in% declines$decline_id[declines$recovery_0.95 == FALSE]) %>% # Select unrecovered declines 
+#   separate_rows(dominant_correlate, sep = ", ") %>% 
+#   filter(dominant_correlate == "prod_per_cap") %>% 
+#   count(decline_id, sort = TRUE)
+  
+declines_assoc_w_prod <- main_correlates %>% 
+  separate_rows(dominant_correlate, sep = ", ") %>% 
+  filter(dominant_correlate == "prod_per_cap") # n = 842
+```
+
+Get production time series during those declines.
+```{r}
+food_production <- food_balance %>% 
+  
+  # Select production only
+  filter(element_code == 5511) %>% 
+  mutate(production = quantity*1000*1000, .keep = "unused") %>% # Convert to kg
+  select(-unit, -element, -element_code) %>% 
+  
+  # Filter to only the years within unrecovered decline events associated with per cap production
+  right_join(
+    ts_w_declines %>% 
+      select(decline_id, area_code, area, item_code, item, year) %>% 
+      filter(decline_id %in% declines_assoc_w_prod$decline_id),
+    by = c("area_code", "area", "item_code", "item", "year")
+    ) %>%
+
+  arrange(decline_id, year) 
+```
+
+For every decline, extract coefficient of linear model: `production ~ year`
+```{r}
+# Overall
+food_production %>% 
+  nest(decline_ts = -decline_id) %>% 
+  mutate(lm = map(decline_ts, ~lm(production ~ year, data = .))) %>% 
+  mutate(lm_tidied = map(lm, tidy)) %>% 
+  unnest(lm_tidied) %>% 
+  filter(term == "year") %>% 
+  select(decline_id, 
+         lm_coef = estimate) %>% # No NAs generated at this stage..
+  right_join(declines_assoc_w_prod) %>%
+  count(abs_prod_decline = lm_coef < 0) %>% 
+  mutate(prop = n/sum(n))
+
+# By food group
+food_production %>% 
+  nest(decline_ts = -decline_id) %>% 
+  mutate(lm = map(decline_ts, ~lm(production ~ year, data = .))) %>% 
+  mutate(lm_tidied = map(lm, tidy)) %>% 
+  unnest(lm_tidied) %>% 
+  filter(term == "year") %>% 
+  select(decline_id, 
+         lm_coef = estimate) %>% # No NAs generated at this stage..
+  right_join(declines_assoc_w_prod) %>%
+  count(abs_prod_decline = lm_coef < 0, 
+        food_group) %>% 
+  mutate(prop = n/sum(n))
+
+food_production %>% 
+  nest(decline_ts = -decline_id) %>% 
+  mutate(lm = map(decline_ts, ~lm(production ~ year, data = .))) %>% 
+  mutate(lm_tidied = map(lm, tidy)) %>% 
+  unnest(lm_tidied) %>% 
+  filter(term == "year") %>% 
+  select(decline_id, 
+         lm_coef = estimate) %>% 
+  right_join(declines_assoc_w_prod) %>%
+  count(abs_prod_decline = lm_coef < 0, 
+        food_group) %>% 
+  
+  # Plot
+  ggplot(aes(x = n, y = food_group, fill = abs_prod_decline)) +
+  geom_bar(position = "fill", stat = "identity") +
+  labs(fill = "Absolute production decline?") +
+  scale_x_continuous(labels = scales::percent) +
+  cowplot::theme_cowplot()
+```
+
+## Check if available data meets a threshold of supply
+
+```{r}
+ts_w_declines %>% 
+  filter(decline_id %in% unique(declines_assoc_w_prod$decline_id)) %>%
+  rename(supply_per_cap = quantity) %>%
+  left_join(food_balance_per_cap) %>% 
+  select(decline_id, year, supply_per_cap, prod_per_cap, export_per_cap, import_per_cap, feed_per_cap, seed_per_cap) %>% 
+  group_by(decline_id) %>% 
+  filter(year == max(year)) %>% 
+  ungroup() %>% 
+  mutate(export_per_cap = export_per_cap * -1,
+         feed_per_cap = feed_per_cap * -1,
+         seed_per_cap = seed_per_cap * -1) %>% 
+  rowwise() %>% 
+  mutate(sum = sum(c_across(4:8), na.rm = TRUE)) %>% 
+  mutate(prop_of_supply = sum/supply_per_cap) %>% 
+  mutate(within_thresh = if_else(prop_of_supply < 1.15 & prop_of_supply > .85, TRUE, FALSE)) %>% 
+  count(within_thresh)
+```
+
+## Use same method to investigate if harvestable area and yield also declined
+
+Get area & yield time series during production-associated declines of CROP items only. Note that items in the crops dataset are not the same as those in food balance sheets, so we'll need to map across them. Mel provided a key she made that does so. In it, FAO_item_code represents the crop item code, and FAO_item_code_NFB represents the FBS item code.
+```{r}
+distinct(crops, element_code, element)
+
+# Area harvested during declines
+area_harvested <- crops %>% 
+  
+  # Select production only
+  filter(element_code == 5312) %>% # hectares
+  select(-unit, -element, -element_code, -flag) %>% 
+  
+  # Add FAO item from key
+  left_join(fbs_to_crops_key %>% 
+              select(FAO_item_code, FAO_item_code_NFB),
+            by = c("item_code" = "FAO_item_code")) %>% 
+    
+  # Summarize all crop items by FBS item
+  group_by(area_code, area, FAO_item_code_NFB, year) %>% 
+  summarize(value = sum(value, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  
+  # Filter to only the years within unrecovered CROP decline events associated with per cap production
+  right_join(
+    ts_w_declines %>% 
+      select(decline_id, area_code, area, item_code, item, sector, year) %>% 
+      filter(decline_id %in% declines_assoc_w_prod$decline_id,
+             sector == "Crops"),
+    by = c("area_code", "area", "FAO_item_code_NFB" = "item_code", "year")
+    ) %>%
+
+  arrange(decline_id, year) 
+
+# Yield during declines
+yield <- crops %>% 
+  
+  # Select production only
+  filter(element_code == 5419) %>% # hectograms/hectare
+  select(-unit, -element, -element_code, -flag) %>% 
+  
+  # Add FAO item from key
+  left_join(fbs_to_crops_key %>% 
+              select(FAO_item_code, FAO_item_code_NFB),
+            by = c("item_code" = "FAO_item_code")) %>% 
+    
+  # Summarize all crop items by FBS item
+  group_by(area_code, area, FAO_item_code_NFB, year) %>% 
+  summarize(value = sum(value, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  
+  # Filter to only the years within unrecovered CROP decline events associated with per cap production
+  right_join(
+    ts_w_declines %>% 
+      select(decline_id, area_code, area, item_code, item, sector, year) %>% 
+      filter(decline_id %in% declines_assoc_w_prod$decline_id,
+             sector == "Crops"),
+    by = c("area_code", "area", "FAO_item_code_NFB" = "item_code", "year")
+    ) %>%
+
+  arrange(decline_id, year) 
+```
+
+For every decline, extract coefficient of linear model: `value ~ year`, where value == area or yield
+```{r}
+# Overall
+area_harvested_results <- area_harvested %>% 
+  na.omit() %>% 
+  nest(decline_ts = -decline_id) %>% 
+  mutate(lm = map(decline_ts, ~lm(value ~ year, data = .))) %>% 
+  mutate(lm_tidied = map(lm, tidy)) %>% 
+  unnest(lm_tidied) %>% 
+  filter(term == "year") %>% 
+  select(decline_id, 
+         lm_coef = estimate) %>% # No NAs generated at this stage..
+  left_join(declines_assoc_w_prod) 
+
+area_harvested_results %>%
+  count(harvestable_area_decline = lm_coef < 0) %>% 
+  mutate(prop = n/sum(n))
+
+# By food group
+yield_results <- yield %>% 
+  na.omit() %>% 
+  nest(decline_ts = -decline_id) %>% 
+  mutate(lm = map(decline_ts, ~lm(value ~ year, data = .))) %>% 
+  mutate(lm_tidied = map(lm, tidy)) %>% 
+  unnest(lm_tidied) %>% 
+  filter(term == "year") %>% 
+  select(decline_id, 
+         lm_coef = estimate) %>% # No NAs generated at this stage..
+  left_join(declines_assoc_w_prod)
+
+yield_results %>% 
+count(yield_decline = lm_coef < 0) %>% 
+  mutate(prop = n/sum(n))
+
+# What percentage of production-associated crop declines also had declines in harvestable area while yield stayed the same or increased?
+yield_results %>% 
+  select(decline_id, yield_coef = lm_coef) %>% 
+  left_join(area_harvested_results %>% 
+              select(decline_id, area_coef = lm_coef)) %>% 
+  filter(area_coef < 0,
+         yield_coef >= 0) %>% 
+  nrow() / 519 
+```

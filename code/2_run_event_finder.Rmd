@@ -1,0 +1,241 @@
+---
+title: "Run decline/incline event finder"
+author: "Danielle Ferraro, Gordon Blasco"
+date: "8/3/2021"
+output: html_document
+---
+
+## Overview
+
+This document details the code used to run the decline/incline event finder for Track 2 of the Clean Seafood project. The event finder code is run with several different parameters to test the sensivity of the analysis. The parameters tested include the forgiveness window (the allowed length of time between two events that triggers them being grouped into one event) and the minimum allowed duration of the resulting events. 
+
+## Setup
+
+Load packages:
+```{r}
+library(here)
+library(tidyverse)
+library(slider)
+library(trend) 
+library(purrr)
+```
+
+Source filepaths:
+```{r}
+source(here("src", "directories.R"))
+```
+
+Source functions:
+```{r}
+source(here("src", "decline_functions.R"))  
+```
+
+## Define parameters to test
+
+Forgiveness window values tested: 4, 5, 6, 7 years
+Minimum event duration values tested: 5, 7, 10, 15 years
+```{r}
+param_grid <- data.frame(
+  "mean_window" = 5,
+  "slope_window" = 5,
+  "threshold_value" = 1000000,
+  "trend_type_value" = c("incline","decline"),
+  "forg_window_value" = c(4, 5, 6, 7),
+  "min_duration_value" = c(5,7,10,15),
+  "slope_filter_value" = 0.2,
+  "tau_filter_value" = 0.6
+) %>% 
+  expand(mean_window,
+         slope_window,
+         threshold_value,
+         trend_type_value,
+         forg_window_value,
+         min_duration_value,
+         slope_filter_value,
+         tau_filter_value) %>% 
+  mutate(slope_filter_value = 
+           if_else(trend_type_value == "decline", slope_filter_value* -1, slope_filter_value),
+         tau_filter_value = 
+           if_else(trend_type_value == "decline", tau_filter_value* -1, tau_filter_value))
+```
+
+## Load tidied and filtered food balance data
+
+```{r}
+food_balance <- read_csv(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy_filtered.csv"))
+
+# Extract food supply only
+food_supply <- food_balance %>%
+  filter(element_code == 645) %>%
+  select(-element_code) %>%
+  group_split(area, item_code)
+```
+
+# Combine event finder functions and write function to summarize results
+```{r}
+# Turn all event finder functions into a single function
+total_decline_function <- function(
+  data, 
+  mean_window = 5,
+  slope_window = 5,
+  threshold_value = 1000000,
+  trend_type_value = "incline",
+  forg_window_value = 4,
+  min_duration_value = 10,
+  slope_filter_value = 0.2,
+  tau_filter_value = 0.6) {
+  
+ data <- data %>%
+  
+  # Rolling average smoother
+  map(., rolling_average,
+      window        = mean_window,
+      time_col      = year,
+      value_col     = quantity,
+      new_col       = meaned_quant) %>%
+  
+  # Rolling slope extraction
+  map(., rolling_slope,
+      window        = slope_window,
+      time_col      = year,
+      value_col     = meaned_quant,
+      new_col       = slope) %>%
+  
+  # Remove problematic timeseries
+  discard(., ~is.character(.)) %>%
+  
+  # Classify slopes
+  map(., classify_slope,
+      threshold     = threshold_value,
+      value_column  = meaned_quant,
+      slope_column  = slope,
+      new_col       = trend_char) %>% 
+  
+  # Find inclines or declines (i.e., events)
+  map(., event_finder,
+      trend_col          = trend_char,
+      trend_type         = trend_type_value,
+      year_col           = year,
+      forgiveness_window = forg_window_value,
+      min_duration       = min_duration_value) %>%
+  
+  # Remove timeseries with no events
+  discard(., ~is.character(.)) %>% 
+  
+  # Run significance test
+  map(., significance_test, 
+      event_col          = event_id,
+      slope_filter       = slope_filter_value,
+      tau_filter         = tau_filter_value) %>%
+  
+  # Remove timeseries with no declines after the significance test
+  discard(~ all(is.na(.$event_id)))
+ 
+}
+
+ 
+# Turn each time series into a row in a dataframe
+brew_summary_stats_1 <- function(data){
+  
+  data %>% 
+    filter(!is.na(event_id)) %>% 
+    group_by(area_code, item_code, event_id) %>% 
+    summarize(
+      duration = n(),
+      perc_change = min(quantity)/max(quantity)
+    ) %>% 
+  ungroup() %>% 
+    mutate(tally = 1)
+}
+
+# Sum that data frame into one row for easy comparison
+brew_summary_stats_2 <- function(data){
+  
+  dec_item_counts <- data %>% 
+      group_by(item_code) %>% 
+      summarise(
+        n_declines = sum(tally)
+      ) %>% 
+      ungroup() %>% 
+      pivot_wider(names_from = item_code, names_prefix = "item_", values_from = n_declines)
+  
+  tot_counts <- data %>% 
+    summarise(
+      total_dec = sum(tally)) 
+  
+  total_timeseries <- data %>% 
+    distinct(area_code, item_code, .keep_all = TRUE) %>% 
+    summarise(
+      total_timeseries = sum(tally)
+    ) %>% 
+    ungroup()
+  
+  
+  dec_stats <- data %>% 
+      summarise(
+        mean_duration = mean(duration), 
+        dur_sd = sd(duration),
+        mean_perc_change = mean(perc_change),
+        perc_change_sd = sd(perc_change)
+      ) %>% 
+      cbind(tot_counts) %>% 
+      cbind(total_timeseries) %>% 
+      cbind(dec_item_counts)
+  
+  return(dec_stats)
+  
+}
+
+generate_summary <- function(data){
+
+  data %>% 
+    map_df(., brew_summary_stats_1) %>% 
+    brew_summary_stats_2()
+  
+}
+```
+
+## Loop the event finder over all parameter values
+
+Note: this code chunk takes some time (~21 hours)
+```{r}
+param_final <- param_grid %>% 
+  mutate(final_data = list(NA))
+
+tictoc::tic()
+for (i in 1:nrow(param_grid)) {
+  
+    this_mean_window = param_grid$mean_window[i]
+    this_slope_window = param_grid$slope_window[i]
+    this_threshold_value = param_grid$threshold_value[i]
+    this_trend_type_value = as.character(param_grid$trend_type_value[i])
+    this_forg_window_value = param_grid$forg_window_value[i]
+    this_min_duration_value = param_grid$min_duration_value[i]
+    this_slope_filter_value = param_grid$slope_filter_value[i]
+    this_tau_filter_value = param_grid$tau_filter_value[i]
+  
+  prepped_fxn <- food_supply %>% 
+  total_decline_function(
+    mean_window = this_mean_window,
+    slope_window = this_slope_window,
+    threshold_value = this_threshold_value,
+    trend_type_value = this_trend_type_value,
+    forg_window_value = this_forg_window_value,
+    min_duration_value = this_min_duration_value,
+    slope_filter_value = this_slope_filter_value,
+    tau_filter_value = this_tau_filter_value) %>% 
+  list()
+    
+  param_final$final_data[i] <- prepped_fxn
+}
+tictoc::toc()
+```
+
+Summarize and save results.
+```{r}
+param_final <- param_final %>% 
+  mutate(summary = map(final_data, generate_summary))
+
+write_rds(param_final, file.path(dir_data_bottlenecks, "declines", "parameter_test_final_filtered.rds"))
+```
+

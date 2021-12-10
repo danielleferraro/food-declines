@@ -1,0 +1,148 @@
+---
+title: "Tidy and filter data: Food Balance Sheets"
+author: "Gordon Blasco, Danielle Ferraro"
+date: "9/18/2019"
+output: html_document
+---
+
+## Overview
+
+This document contains code to tidy data for Track 2 of the Clean Seafood project. We use FAO Food Balance Sheets (FBS) for food supply data. Two products are created here: a complete FBS dataset that has been tidied, and one that has been both tidied and filtered. The filtering steps taken were:
+
+- Remove all aggregated food items (e.g. Animal products) leaving only individual food items
+- Remove all aggregated regions (e.g. continents) leaving only individual countries
+- Remove Yugoslavia Socialist Federal Republic countries due to discontinuities between the former and current time series:
+  - Slovenia
+  - Croatia
+  - Bosnia and Herzegovina
+  - Macedonia
+  - Serbia and Montenegro (union and separate)
+- Remove former Soviet Union countries due to discontinuities between the former and current time series:
+  - Armenia
+  - Azerbaijan
+  - Belarus
+  - Estonia
+  - Georgia
+  - Kazakhstan
+  - Kyrgyzstan
+  - Latvia
+  - Lithuania
+  - Moldova
+  - Russia
+  - Tajikistan
+  - Turkmenistan
+  - Ukraine
+  - Uzbekistan
+- Remove Luxembourg (incomplete time series; data begins 2000) 
+- Remove former Sudan (only two years of data)
+
+## Setup
+```{r}
+library(here)
+library(tidyverse)
+library(janitor)
+library(readxl)
+
+source(here("src", "directories.R")) # Sets file directories 
+```
+
+
+## Import data
+```{r}
+# Food balance sheets
+food_balance <- read_csv(file.path(dir_raw_data, "FAO/food_balance/FoodBalanceSheets_E_All_Data_NOFLAG.csv"))
+
+area_code <- food_balance %>% 
+  distinct(`Area`, `Area Code`) %>% 
+  clean_names()
+
+item_code <- food_balance %>% 
+  distinct(`Item`, `Item Code`) %>% 
+  clean_names()
+
+element_code <- food_balance %>% 
+  distinct(`Element`, `Element Code`) %>% 
+  clean_names()
+
+code_item_group <- read_csv(file.path(dir_raw_data, "FAO", "food_balance", "FoodBalanceSheets_Metadata_ItemGroupCode.csv"), locale = locale(encoding = "latin1")) %>% 
+  clean_names()
+```
+
+## Tidy data
+```{r}
+# Food balance sheets
+clean_food_balance <- food_balance %>% 
+  gather(
+    key = "year",
+    value = "quantity",
+    c(8:60)
+  ) %>% 
+  clean_names() %>% 
+  mutate(year = parse_number(year))
+```
+
+## Identify data to filter out
+```{r}
+# Define list of USSR and successor nations
+former_ussr <-   
+  c("Armenia",
+  "Azerbaijan",
+  "Belarus",
+  "Estonia",
+  "Georgia",
+  "Kazakhstan",
+  "Kyrgyzstan",
+  "Latvia",
+  "Lithuania",
+  "Republic of Moldova",
+  "Russian Federation",
+  "Tajikistan",
+  "Turkmenistan",
+  "Ukraine",
+  "Uzbekistan")
+
+length(former_ussr)
+area_code %>% filter(area %in% former_ussr) %>% nrow()
+
+# Define list of Yugoslavia SFR and successor nations
+former_yugoslavia <- 
+  c("Slovenia",
+  "Croatia",
+  "Bosnia and Herzegovina",
+  "The former Yugoslav Republic of Macedonia",
+  "Serbia and Montenegro",
+  "Serbia",
+  "Montenegro")
+
+length(former_yugoslavia)
+area_code %>% filter(area %in% former_yugoslavia) %>% nrow()
+
+# Combine countries to remove in one dataframe
+countries_to_remove <- tibble(area = c(former_ussr, 
+                                       former_yugoslavia, 
+                                       "Luxembourg",
+                                       "Sudan (former)")) %>% 
+  left_join(area_code, by = "area")
+filter(countries_to_remove, is.na(area_code)) # Check for NAs
+```
+
+## Filter data
+```{r}
+filtered_food_balance <- clean_food_balance %>% 
+  filter(!area_code %in% countries_to_remove$area_code, # Remove countries as defined above
+         area_code < 5000, # Remove aggregated geographic regions
+         !item_code %in% unique(code_item_group$item_group_code)) # Remove item groups (keep individual items only)
+```
+
+## Write the csvs
+```{r}
+# Unfiltered food balance sheets and metadata
+write_csv(clean_food_balance, file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy.csv"))
+write_csv(area_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "area_code.csv"))
+write_csv(item_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "item_code.csv"))
+write_csv(element_code, file.path(dir_data, "bottlenecks_data", "FAO", "food_balances", "element_code.csv"))
+
+# Filtered food balance sheets
+write_csv(filtered_food_balance, file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy_filtered.csv"))
+```
+

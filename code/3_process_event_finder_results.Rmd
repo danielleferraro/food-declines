@@ -1,0 +1,364 @@
+---
+title: "Process event finder results"
+author: "Danielle Ferraro"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Overview
+
+This script takes the output of the event finder code (detailed in `2_run_event_finder.Rmd`) and characterizes each detected event by calculating the event's magnitude and duration as well as adding country/food item metadata.  I also filter out any results relating to time series not at the country-item level (i.e. aggregated geographic regions and/or food item groups). Additionally, all declines were classified as recovered or unrecovered depending on if they returned to pre-decline quantities or not. Once characterized, the declines and inclines are written as a csv in the Clean Seafood data folder on the NCEAS Aurora server (`/home/shares/clean-seafood/data/bottlenecks_data/declines`). 
+
+# Setup
+
+Load packages.
+```{r}
+library(here)       # Relative file paths
+library(tidyverse)  # Data wrangling and ggplot
+library(vroom)      # For fast reading of files 
+library(janitor)    # For clean_names()
+library(cowplot)    # For ggplot theme theme_cowplot()
+```
+
+Set directories.
+```{r}
+source(here("src", "directories.R"))
+```
+
+# Load data 
+
+## Raw data and key
+
+```{r}
+# Key
+food_group_key <- read_csv(file.path(dir_data_bottlenecks, "keys", "fao_fbs_food_groups.csv"))
+
+# Tidied and filtered food balance data (to cross reference total number of time series, etc)
+food_balance <- vroom(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy_filtered.csv"), delim = ",", locale = locale(encoding = "latin1"))
+
+# Metadata
+code_item_group <- read_csv(file.path(dir_raw_data, "FAO", "food_balance", "FoodBalanceSheets_Metadata_ItemGroupCode.csv"), locale = locale(encoding = "latin1")) %>% 
+  clean_names()
+country_metadata <- read_csv(file.path(dir_raw_data, "FAO", "production", "CL_FI_COUNTRY_GROUPS.csv"), # From production dataset
+                             locale = locale(encoding = "latin1"), 
+                             col_types = cols("UN_Code" = col_integer())) %>% 
+  clean_names()
+```
+
+# Process data
+
+## Check for existing data
+
+Read in incline and decline event files, if they exist.
+```{r}
+existing_declines_file <- "characterized_declines_2021-08-13.csv"
+existing_inclines_file <- "characterized_inclines_2021-08-13.csv"
+existing_ts_w_declines_file <- "ts_w_declines_2021-08-13.csv"
+existing_ts_w_inclines_file <- "ts_w_inclines_2021-08-13.csv"
+
+# Characterized declines
+if(file.exists(file.path(dir_data_bottlenecks, "declines", existing_declines_file))) {
+   declines <- read_csv(file.path(dir_data_bottlenecks, "declines", existing_declines_file))
+} else {
+  message("File does not exist. Run subsequent chunks.")
+}
+
+# Characterized inclines
+if(file.exists(file.path(dir_data_bottlenecks, "declines", existing_inclines_file))) {
+   inclines <- read_csv(file.path(dir_data_bottlenecks, "declines", existing_inclines_file))
+} else {
+  message("File does not exist. Run subsequent chunks.")
+}
+
+# Time series with declines detected
+if(file.exists(file.path(dir_data_bottlenecks, "declines", existing_ts_w_declines_file))) {
+   ts_w_declines <- read_csv(file.path(dir_data_bottlenecks, "declines", existing_ts_w_declines_file))
+} else {
+  message("File does not exist. Run subsequent chunks.")
+}
+
+# Time series with inclines detected
+if(file.exists(file.path(dir_data_bottlenecks, "declines", existing_ts_w_inclines_file))) {
+   ts_w_inclines <- read_csv(file.path(dir_data_bottlenecks, "declines", existing_ts_w_inclines_file))
+} else {
+  message("File does not exist. Run subsequent chunks.")
+}
+```
+
+## Generate data if necessary
+
+If files do not already exist, run the following chunk to generate them. This code needs to be re-run if the food item key changes.
+```{r}
+# Outputs of parameter test; contains both decline and incline detection results. Large file, so subset asap
+parameter_tests <- readRDS(file.path(dir_data_bottlenecks, "declines", "parameter_test_final_filtered.rds"))
+
+# Subset one run of parameter test, and remove full object from environment because it's so big and keeps breaking R!
+data <- subset(parameter_tests, trend_type_value %in% c("decline", "incline") & 
+                     min_duration_value == 10 &
+                     forg_window_value == 5)
+
+rm(parameter_tests)
+
+# Assign run parameters for future reference and extract out the nested time series data.
+params <- select(data, -final_data, -summary)
+
+# Pull out time series data with DECLINE events appended
+ts_w_declines <- data %>% 
+  filter(trend_type_value == "decline") %>% 
+  pull(final_data) %>% # Unnest data
+  pluck(1) %>% 
+  bind_rows() %>% # Convert from list to data frame
+  filter(area_code < 5000, # Remove aggregated geographic regions
+         !item_code %in% unique(code_item_group$item_group_code)) %>% # Remove item groups (keep individual items only)
+  left_join(select(food_group_key, item_code, item_group_code, item_group, food_group, sector), by = "item_code") %>% # Add food item metadata
+    left_join(country_metadata[,c("eco_class_group", "geo_region_group", "continent_group", "identifier")], by = c("area_code" = "identifier")) %>% # Add country metadata
+  mutate(eco_class_group = if_else(area == "China", "Other developing countries or areas", eco_class_group),
+         geo_region_group = if_else(area == "China", "Eastern Asia", geo_region_group),
+         continent_group = if_else(area == "China", "Asia", continent_group)) %>% # Set China's data manually since there is a country number mismatch
+  select(area_code, area, geo_region_group, continent_group, eco_class_group, item_code, item, item_group_code, item_group, food_group, sector, everything()) %>% 
+  arrange(area, item, year)
+
+# Pull out time series data with INCLINE events appended
+ts_w_inclines <- data %>% 
+  filter(trend_type_value == "incline") %>% 
+  pull(final_data) %>% # Unnest data
+  pluck(1) %>% 
+  bind_rows() %>% # Convert from list to data frame
+  filter(area_code < 5000, # Remove aggregated geographic regions
+         !item_code %in% unique(code_item_group$item_group_code)) %>% # Remove item groups (keep individual items only)
+  left_join(select(food_group_key, item_code, item_group_code, item_group, food_group, sector), by = "item_code") %>% # Add food item metadata
+    left_join(country_metadata[,c("eco_class_group", "geo_region_group", "continent_group", "identifier")], by = c("area_code" = "identifier")) %>% # Add country metadata
+  mutate(eco_class_group = if_else(area == "China", "Other developing countries or areas", eco_class_group),
+         geo_region_group = if_else(area == "China", "Eastern Asia", geo_region_group),
+         continent_group = if_else(area == "China", "Asia", continent_group)) %>% # Set China's data manually since there is a country number mismatch
+  select(area_code, area, geo_region_group, continent_group, eco_class_group, item_code, item, item_group_code, item_group, food_group, sector, everything()) %>% 
+  arrange(area, item, year)
+
+
+# Build list of events and calculate magnitude and duration of each
+
+# DECLINE events
+declines <- ts_w_declines %>%
+  group_by(area_code, item_code) %>%
+  mutate(max_quant = max(quantity),
+         max_smoothed_quant = max(meaned_quant)) %>%
+  ungroup() %>%
+  drop_na(event_id) %>%
+  group_by(across(-c("year", "quantity", "meaned_quant", "slope", "threshold", "trend_char"))) %>% 
+  arrange(year) %>% 
+  summarize(start = min(year),
+            end = max(year),
+            duration = max(year) - min(year) + 1, # Adding one so the durations reflect the beginning of the start year
+            start_quant = first(quantity),
+            end_quant = last(quantity),
+            abs_change = last(quantity) - first(quantity),
+            prop_change = (last(quantity) - first(quantity))/first(quantity),
+            max_smoothed_quant = max(meaned_quant)) %>%
+  ungroup() %>%
+  mutate(magnitude_bin = cut(prop_change, breaks = c(-1, -0.75, -0.5, -0.25, 0)),
+         duration_bin = cut(duration, breaks = c(10, 20, 30, 40, 50, 60), right = FALSE)) %>%
+select(area, area_code, eco_class_group, geo_region_group, continent_group, item, item_code, item_group, item_group_code, food_group, sector, element, unit, event_id, start, end, duration, start_quant, end_quant, abs_change, prop_change, magnitude_bin, duration_bin, everything()) %>% 
+  arrange(area, item) %>% 
+  mutate(decline_id = row_number()) # Add unique id
+
+# INCLINE events
+inclines <- ts_w_inclines %>%
+  group_by(area_code, item_code) %>%
+  mutate(max_quant = max(quantity),
+         max_smoothed_quant = max(meaned_quant)) %>%
+  ungroup() %>%
+  drop_na(event_id) %>%
+  group_by(across(-c("year", "quantity", "meaned_quant", "slope", "threshold", "trend_char"))) %>% 
+  arrange(year) %>%
+  summarize(start = min(year),
+            end = max(year),
+            duration = max(year) - min(year) + 1, # Adding one so the durations reflect the beginning of the start year
+            start_quant = first(quantity),
+            end_quant = last(quantity),
+            abs_change = last(quantity) - first(quantity),
+            prop_change = (last(quantity) - first(quantity[quantity>0]))/first(quantity[quantity>0]),
+            max_smoothed_quant = max(meaned_quant)) %>%
+  ungroup() %>%
+  mutate(magnitude_bin = cut(prop_change, breaks = c(0, 0.25, 0.5, 0.75, 1, Inf)), # Last bin = >1
+         duration_bin = cut(duration, breaks = c(10, 20, 30, 40, 50, 60), right = FALSE)) %>%
+  select(area, area_code, eco_class_group, geo_region_group, continent_group, item, item_code, item_group, item_group_code,  food_group, sector, element, unit, event_id, start, end, duration, start_quant, end_quant, abs_change, prop_change, magnitude_bin, duration_bin, everything()) %>% 
+  arrange(area, item) %>% 
+  mutate(incline_id = row_number()) # Add unique id
+
+# Add decline/incline ids to the time series data
+ts_w_declines <- ts_w_declines %>% 
+  left_join(select(declines, area_code, item_code, event_id, decline_id))
+
+ts_w_inclines <- ts_w_inclines %>% 
+  left_join(select(inclines, area_code, item_code, event_id, incline_id))
+
+# For declines only, determine if events ever recovered to a threshold (75%, 80%, 85%, 90%, 95%) of their original quantity or not
+recovery <- declines %>% 
+  select(decline_id, area_code, area, item_code, item, start, end, duration, end_quant, abs_change, prop_change) %>% 
+  left_join(select(ts_w_declines, area_code, item_code, year, quantity), by = c("area_code", "item_code")) # Add raw supply quantity time series to declines data
+
+# Function to detect decline recovery
+detect_decline_recovery <- function(dat,
+                                    year_col = year,
+                                    quantity_col = quantity,
+                                    end_col = end,
+                                    end_quant_col = end_quant,
+                                    abs_change_col = abs_change,
+                                    thresh) {
+  dat %>% mutate(
+    "recovery_{thresh}" := case_when({{year_col}} > {{end_col}} & {{quantity_col}} <= {{end_quant_col}} + thresh*abs({{abs_change_col}}) ~ 0,
+                                     {{year_col}} > {{end_col}} & {{quantity_col}} >= {{end_quant_col}} + thresh*abs({{abs_change_col}}) ~ 1,
+                                     TRUE ~ 0))
+}
+
+# Loop function over the set of thresholds and summarize results (should rewrite this code more efficiently)
+for(x in seq(0.75, 0.95, by = 0.05)) {
+  recovery <- detect_decline_recovery(recovery, thresh = x)
+} 
+
+recovery <- recovery %>%
+  group_by(decline_id) %>% 
+  summarize(across(starts_with("recovery"), max)) 
+
+# Append recovery information to declines data frame
+declines <- declines %>% 
+  left_join(recovery, by = "decline_id") %>% 
+  select(decline_id, everything())
+
+# Pair coincident inclines and declines together
+coincident_events <- declines %>% 
+  left_join(inclines %>% 
+              rename_all(paste0, "_incline"), by = c("area" = "area_incline", "area_code" = "area_code_incline")) %>% 
+  filter(start_incline >= start - 2 & start_incline <= start + 2) %>% # Incline begins +/- 2 years of decline start year
+  filter(max_smoothed_quant_incline >= max_smoothed_quant - (max_smoothed_quant*0.5) & max_smoothed_quant_incline <= max_smoothed_quant + (max_smoothed_quant*0.5)) %>%  # Max smoothed quantity of incline item must be within 50% of decline maximum 
+  mutate(same_food_group = if_else(food_group == food_group_incline, TRUE, FALSE)) %>% 
+  mutate(has_coincident_incline = 1) # Should do sensitivity tests
+
+# Proportion of unrecovered vs. recovered events with coincident inclines
+coincident_events %>% 
+  distinct(decline_id, has_coincident_incline) %>% 
+  right_join(declines) %>% 
+  count(recovery_0.95, has_coincident_incline) %>% 
+  group_by(recovery_0.95) %>% 
+  mutate(prop = n/sum(n))
+
+# Try other thresholds - 3, 4, 5 years
+coincident_events_3 <- declines %>% 
+  left_join(inclines %>% 
+              rename_all(paste0, "_incline"), by = c("area" = "area_incline", "area_code" = "area_code_incline")) %>% 
+  filter(start_incline >= start - 3 & start_incline <= start + 3) %>% # Incline begins +/- 3 years of decline start year
+  filter(max_smoothed_quant_incline >= max_smoothed_quant - (max_smoothed_quant*0.5) & max_smoothed_quant_incline <= max_smoothed_quant + (max_smoothed_quant*0.5)) %>%  # Max smoothed quantity of incline item must be within 50% of decline maximum 
+  mutate(same_food_group = if_else(food_group == food_group_incline, TRUE, FALSE)) %>% 
+  mutate(has_coincident_incline = 1,
+         thresh = 3) 
+
+coincident_events_4 <- declines %>% 
+  left_join(inclines %>% 
+              rename_all(paste0, "_incline"), by = c("area" = "area_incline", "area_code" = "area_code_incline")) %>% 
+  filter(start_incline >= start - 4 & start_incline <= start + 4) %>% # Incline begins +/- 4 years of decline start year
+  filter(max_smoothed_quant_incline >= max_smoothed_quant - (max_smoothed_quant*0.5) & max_smoothed_quant_incline <= max_smoothed_quant + (max_smoothed_quant*0.5)) %>%  # Max smoothed quantity of incline item must be within 50% of decline maximum 
+  mutate(same_food_group = if_else(food_group == food_group_incline, TRUE, FALSE)) %>% 
+  mutate(has_coincident_incline = 1,
+         thresh = 4) 
+
+coincident_events_5 <- declines %>% 
+  left_join(inclines %>% 
+              rename_all(paste0, "_incline"), by = c("area" = "area_incline", "area_code" = "area_code_incline")) %>% 
+  filter(start_incline >= start - 5 & start_incline <= start + 5) %>% # Incline begins +/- 5 years of decline start year
+  filter(max_smoothed_quant_incline >= max_smoothed_quant - (max_smoothed_quant*0.5) & max_smoothed_quant_incline <= max_smoothed_quant + (max_smoothed_quant*0.5)) %>%  # Max smoothed quantity of incline item must be within 50% of decline maximum 
+  mutate(same_food_group = if_else(food_group == food_group_incline, TRUE, FALSE)) %>% 
+  mutate(has_coincident_incline = 1,
+         thresh = 5) 
+
+coincident_events_1 <- declines %>% 
+  left_join(inclines %>% 
+              rename_all(paste0, "_incline"), by = c("area" = "area_incline", "area_code" = "area_code_incline")) %>% 
+  filter(start_incline >= start - 1 & start_incline <= start + 1) %>% # Incline begins +/- 1 years of decline start year
+  filter(max_smoothed_quant_incline >= max_smoothed_quant - (max_smoothed_quant*0.5) & max_smoothed_quant_incline <= max_smoothed_quant + (max_smoothed_quant*0.5)) %>%  # Max smoothed quantity of incline item must be within 50% of decline maximum 
+  mutate(same_food_group = if_else(food_group == food_group_incline, TRUE, FALSE)) %>% 
+  mutate(has_coincident_incline = 1,
+         thresh = 1) 
+
+# Plot
+coincident_events %>% 
+  mutate(thresh = 2) %>% 
+  bind_rows(coincident_events_3) %>% 
+  bind_rows(coincident_events_4) %>% 
+  bind_rows(coincident_events_5) %>% 
+  bind_rows(coincident_events_1) %>% 
+  count(thresh, same_food_group) %>% 
+  group_by(thresh) %>% 
+  mutate(prop = n/sum(n)) %>% 
+  ungroup() %>% 
+  
+  ggplot(aes(x = thresh, y = n, fill = same_food_group)) +
+  geom_col(position = "stack") +
+  labs(x = "Allowed time between coinciding events (yr)",
+       y = "Number of coinciding inclines detected") +
+  paletteer::scale_fill_paletteer_d("beyonce::X6",
+                                    labels = c("TRUE" = "Intra-group coinciding incline",
+                                               "FALSE" = "Inter-group coinciding incline"),
+                                    name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  theme_cowplot() +
+  theme(legend.position = "top")
+
+# Save plot
+ggsave(here("output", "figs", "declines_ms", "fig_coincident_events_sensitivity.png"), height = 6, width = 8, dpi = 300)
+```
+
+# Save processed data
+
+Write processed time series and event data to csvs.
+```{r}
+# Time series
+write_csv(ts_w_declines, file.path(dir_data_bottlenecks, "declines", paste0("ts_w_declines_", Sys.Date(), ".csv")))
+write_csv(ts_w_inclines, file.path(dir_data_bottlenecks, "declines", paste0("ts_w_inclines_", Sys.Date(), ".csv")))
+
+# Characterized events
+write_csv(declines, file.path(dir_data_bottlenecks, "declines", paste0("characterized_declines_", Sys.Date(), ".csv")))
+write_csv(inclines, file.path(dir_data_bottlenecks, "declines", paste0("characterized_inclines_", Sys.Date(), ".csv")))
+
+# Characterized coincident events
+write_csv(coincident_events, file.path(dir_data_bottlenecks, "declines", "declines_w_coincident_inclines.csv"))
+```
+
+# Plot time series
+
+Plot time series, highlighting the decline/incline events.
+```{r}
+plots_declines <- ts_w_declines %>% 
+  group_split(area_code, item_code) %>% 
+  map(~ggplot(., aes(x = year, y = quantity, color = !is.na(event_id), group = item)) +
+        geom_point(size = 2) +
+        geom_line() +
+        scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+        scale_x_continuous(limits = c(1961, 2013)) +
+        labs(x = "Year",
+             y = "Quantity (kg/capita/yr)",
+             title = paste0(.$area, ": Decline in ", .$item)) +
+        cowplot::theme_half_open() +
+        theme(legend.position = "none")
+      )
+
+pdf(here("output", "figs", paste0("food_supply_declines_", Sys.Date(), ".pdf")), height = 11, width = 8.5)
+ggarrange(plotlist = plots_declines, ncol = 1, nrow = 3, align = "v")
+dev.off()
+
+plots_inclines <- ts_w_inclines %>% 
+  group_split(area_code, item_code) %>% 
+  map(~ggplot(., aes(x = year, y = quantity, color = !is.na(event_id), group = item)) +
+        geom_point(size = 2) +
+        geom_line() +
+        scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+        labs(x = NULL,
+             y = "Food supply quantity (kg/capita/yr)",
+             title = paste0(.$area, ": Incline in ", .$item)) +
+        cowplot::theme_half_open() +
+        theme(legend.position = "none")
+      )
+
+pdf(here("output", "figs", paste0("food_supply_inclines_", Sys.Date(), ".pdf")), height = 11, width = 8.5)
+ggarrange(plotlist = plots_inclines, ncol = 1, nrow = 3, align = "v")
+dev.off()
+```

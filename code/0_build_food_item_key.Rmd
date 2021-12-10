@@ -1,0 +1,90 @@
+---
+title: "Build food balance sheet key"
+author: "Danielle Ferraro"
+date: "12/18/2020"
+output: html_document
+---
+
+# Introduction
+
+The raw Food Balance Sheet data is reported at the item and item group level. In this analysis, we will aggregate those data to broader group and sector levels, so this document builds off the existing key in the FBS metadata to include those broader aggregations.
+
+# Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(janitor)
+
+source(here("src", "directories.R"))
+```
+
+
+# Load data
+
+```{r}
+code_item_group <- read_csv(file.path(dir_raw_data, "FAO", "food_balance", "FoodBalanceSheets_Metadata_ItemGroupCode.csv"), locale = locale(encoding = "latin1")) %>% 
+  clean_names()
+```
+
+# Create key
+
+```{r}
+key <- code_item_group %>% 
+  
+  # Add levels to key
+
+  ## Food group
+  mutate(food_group = case_when(item_group %in% 
+                                  c("Fruits - Excluding Wine", 
+                                    "Vegetables") ~ "Fruits and vegetables",
+                                item_group %in% 
+                                  c("Meat", 
+                                    "Offals") ~ "Meat and offals",
+                                item_group %in% 
+                                  c("Milk - Excluding Butter", 
+                                    "Eggs", 
+                                    "Animal fats") ~ "Milk, eggs, and animal fats",
+                                item_group %in% 
+                                  c("Vegetable Oils", 
+                                    "Oilcrops") ~ "Vegetable oils and oilcrops",
+                                item_group %in% 
+                                  c("Sugar & Sweeteners", 
+                                    "Sugar Crops") ~ "Sugar and sugar crops",
+                                item_group %in% 
+                                  c("Cereals - Excluding Beer", 
+                                    "Pulses") ~ "Cereals and pulses",
+                                item_group %in% 
+                                  c("Fish, Seafood", 
+                                    "Aquatic Products, Other") ~ "Seafood",
+                                item_group %in% 
+                                  c("Miscellaneous", 
+                                    "Treenuts",
+                                    "Stimulants",
+                                    "Spices") ~ "Other",
+                                TRUE ~ str_to_sentence(item_group))) %>%
+  
+  ## Sector
+  mutate(sector = case_when(food_group %in% 
+                              c("Cereals and pulses", 
+                                "Fruits and vegetables", 
+                                "Starchy roots", 
+                                "Sugar and sugar crops", 
+                                "Vegetable oils and oilcrops") |
+                              item_group %in% c("Treenuts", "Stimulants", "Spices") ~ "Crops",
+                            food_group %in% 
+                              c("Meat and offals", 
+                                "Milk, eggs, and animal fats") ~ "Meat, eggs, dairy",
+                            food_group == "Seafood" ~ "Seafood",
+                            food_group == "Alcoholic beverages" ~ "Other",
+                            TRUE ~ food_group)) %>% 
+  
+  # Remove the Grand Total, Animal Products, and Vegetal Products aggregated categories
+  filter(!(item_group %in% c("Animal Products", "Vegetal Products", "Grand Total"))) %>% 
+  
+  # Remove empty columns
+  remove_empty("cols")
+
+write_csv(key, file.path(dir_data_bottlenecks, "keys", "fao_fbs_food_groups.csv"))
+```
+

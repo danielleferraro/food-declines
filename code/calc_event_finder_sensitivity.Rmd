@@ -1,0 +1,86 @@
+---
+title: "Compare event finder parameters"
+author: "Danielle Ferraro"
+date: "8/4/2021"
+output: html_document
+---
+
+## Overview
+
+Visualize and quantity the sensitivity of certain parameters in the event detection analysis. Parameters varied include the forgiveness window between events and minimum event duration.
+
+## Setup
+
+Load packages:
+```{r}
+library(here)
+library(tidyverse)
+library(paletteer)
+library(cowplot) # For ggplot theme
+```
+
+
+Source filepaths:
+```{r}
+source(here("src", "directories.R"))
+```
+
+Source functions:
+```{r}
+source(here("src", "decline_functions.R"))  
+```
+
+## Load data
+
+```{r}
+param_tests <- read_rds(file.path(dir_data_bottlenecks, "declines", "parameter_test_final_filtered.rds"))
+```
+
+Unnest data:
+```{r}
+param_tests_unnested <- param_tests %>% 
+  filter(trend_type_value == "decline") %>% 
+  select(forg_window_value, min_duration_value, final_data) %>% 
+  unnest(final_data) %>% 
+  unnest(final_data)
+```
+
+## Process data
+
+Count number of declines for each combination of parameters.
+```{r}
+decline_counts <- param_tests_unnested %>% 
+  drop_na(event_id) %>% 
+  group_by(forg_window_value, 
+           min_duration_value, 
+           area_code,
+           area,
+           item_code,
+           item) %>% 
+  summarize(n_declines = n_distinct(event_id)) %>% 
+  ungroup() %>% 
+  group_by(forg_window_value, min_duration_value) %>% 
+  summarize(n_declines = sum(n_declines))
+```
+
+## Plot 
+
+```{r}
+pal <- "beyonce::X6"
+
+ggplot(data = decline_counts, 
+       aes(x = forg_window_value, y = n_declines, color = factor(min_duration_value), group = min_duration_value)) +
+  geom_point() +
+  geom_line() +
+  ylim(c(0,NA)) +
+  #scale_color_manual(values = c("#f7575C","#f5ef47","#2c9490","#1d6664")) +
+  scale_color_manual(values = c(paletteer_d(pal)[2:5])) +
+  labs(x = "Forgiveness window length (yr)",
+       y = "Number of decline events detected",
+       color = "Minimum decline duration (yr)") +
+  theme_cowplot() +
+  theme(legend.position = c(0.7, 0.88))
+
+ggsave(here("output", "figs", "declines_ms", "fig_event_finder_sensitivity.png"), width = 10, height = 6, units = "in")
+```
+

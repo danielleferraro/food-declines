@@ -1,0 +1,615 @@
+---
+title: "Select case studies"
+author: "Danielle Ferraro, Rich Cottrell"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Overview
+
+Within the Clean Seafood project's food supply declines paper, we intend to present a small set of case studies that depict instances of historical decreases in the supply of food items. This document describes the process for exploring and flagging countries as possible case studies. The Track 2 team has suggested choosing case studies that represent one or more of the following attributes:
+
+- A supply decline of very large magnitude
+- A supply decline paired with an interesting supply increase of a similar food item
+- A country that has been flagged as aquaculture-dominant, i.e. a "Blue Transition" nation as defined in Track 1
+
+# Setup
+
+Load packages.
+```{r}
+library(here)
+library(tidyverse)
+library(countrycode)
+library(janitor)
+library(vroom)
+library(paletteer)
+library(png)
+library(ggpubr)
+```
+
+Set directories.
+```{r}
+source(here("src", "directories.R"))
+```
+
+Local functions
+```{r}
+
+#for understanding which supply element is most correlated with supply (of production imports or exports)
+
+main_driver <- function(x_df){
+  cols <- which(!grepl("supply", names(x_df))) #isolates correlates other than supply
+  rows <- which(grepl("supply", names(x_df))) #makes sure row selected is for supply and not other elements
+  cor.matrix <- (abs(cor(x_df, method = "spearman", use = "complete.obs")))[rows, cols] #isolates abs values for spearmans rank for correlates
+  high_rho <- as.numeric(na.omit(cor.matrix[which(cor.matrix>=0.9)])) #arbitrarily identify values great or equal to 0.9
+  max <- max(cor.matrix, na.rm = TRUE) #identify max values
+  correlates <- if (length(high_rho>1)) {
+    print(high_rho) #preferentially select two string correlates (i.e. more than one if they are both >0.9)
+  } else {
+    print(max) #or just select the max value if two are not strong
+  }
+  names(cor.matrix[which(cor.matrix %in% correlates)]) #return the correlate names
+  }
+
+
+```
+
+
+
+# Import data
+
+Bring in list of characterized (individual food item) declines and the associated time series data:
+```{r}
+# ts_w_declines # from 03_categorize_food_balance_declines.Rmd
+# inclines <-
+# declines <- read_csv(file.path(dir_data_bottlenecks, "declines", paste0("characterized_declines_",)
+```
+
+As in Track 1, define list of aquaculture-dominant countries:
+```{r}
+characterized_time_series <- read.csv(file.path(dir_data_aquaculture, "characterized_time_series.csv"))
+
+production_tidy <- read_csv(file.path(dir_data_aquaculture, "fao_production_tidy.csv")) %>% 
+  arrange(country_name, year, sector, species) %>% 
+  filter(country_name %in% characterized_time_series$country_name)
+
+aq_dominant_countries <- 
+  production_tidy %>% 
+  group_by(country, country_name, sector, year) %>% 
+  summarise(quantity = sum(quantity)) %>%
+  filter(country_name %in% characterized_time_series$country_name)%>% 
+  group_by(country, country_name) %>% 
+  filter(year == max(year)) %>% 
+  spread(key = sector, value = quantity) %>% 
+  #drop_na(Aquaculture) %>%
+  filter(Aquaculture>Capture) %>% 
+  mutate(area_code = countrycode(as.integer(country), origin = "iso3n", destination = "fao")) %>% 
+  pull(area_code)
+```
+
+# Explore data
+
+```{r}
+# Which aq-dominant countries also have declines?
+
+declines_indiv %>% 
+  filter(area_code %in% aq_dominant_countries) %>% 
+  count(area, sort = TRUE, name = "num_declines") %>% 
+  print(n = Inf) # All countries except for Singapore
+
+declines_indiv %>% 
+  filter(area_code %in% aq_dominant_countries) %>% 
+  count(area, item) %>% view()
+
+# Which aq-dominant countries also have seafood declines?
+declines_indiv %>% 
+  filter(area_code %in% aq_dominant_countries) %>% 
+  filter(item_group == "Fish, Seafood") %>% 
+  count(area, sort = TRUE, name = "num_declines") 
+
+declines_indiv %>% 
+  filter(area_code %in% aq_dominant_countries) %>% 
+  filter(item_group == "Fish, Seafood") %>% 
+  select(area, item, start, end, abs_change, prop_change, max_quant) %>% 
+  arrange(abs_change)
+
+declines_indiv %>% 
+  ggplot(aes(x = abs(abs_change), y = duration)) +
+  geom_bin2d(bins = 30) +
+  #geom_hex() + # Why do white dots appear?
+  labs(x = "Absolute value of loss in food supply (kg/capita/y)",
+       y = "Duration (y)",
+       fill = "# declines") +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw(base_size = 14)
+```
+
+Large declines:
+```{r}
+# What are the five declines with the largest magnitude?
+declines_indiv %>% 
+  arrange(abs_change) %>% 
+  slice(1:5) %>% 
+  select(area, item, start, end, abs_change, prop_change, max_quant)
+```
+
+```{r}
+iceland <- food_balance %>% filter(area == "Iceland")
+iceland %>% 
+  filter(item == "Milk - Excluding Butter") %>% 
+  filter(element %in% c("Production", "Import Quantity", "Export Quantity")) %>% 
+  ggplot(aes(x = year, y = quantity, color = factor(element, levels = c("Production", "Export Quantity", "Import Quantity")))) +
+  geom_line(size = 1.2) +
+  #geom_point() +
+  labs(title = "Iceland: Production and Trade of Milk - Excluding Butter",
+       y = "Quantity (1000 MT)",
+       x = "Year",
+       color = NULL) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "top")
+```
+
+```{r}
+paraguay <- food_balance %>% filter(area == "Paraguay")
+
+paraguay %>% 
+  filter(item == "Bovine Meat") %>% 
+  filter(element %in% c("Production", "Import Quantity", "Export Quantity")) %>% 
+  ggplot(aes(x = year, y = quantity, color = factor(element, levels = c("Production", "Export Quantity", "Import Quantity")))) +
+  geom_line(size = 1.2) +
+  #geom_point() +
+  labs(title = "Paraguay: Bovine Meat and Pigmeat",
+       y = "Quantity (1000 MT)",
+       x = "Year",
+       color = NULL) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "top")
+
+paraguay %>% 
+  filter(item == "Pigmeat") %>% 
+  filter(element %in% c("Production", "Import Quantity", "Export Quantity")) %>% 
+  ggplot(aes(x = year, y = quantity, color = factor(element, levels = c("Production", "Export Quantity", "Import Quantity")))) +
+  geom_line(size = 1.2) +
+  #geom_point() +
+  labs(title = "Paraguay: Bovine Meat and Pigmeat",
+       y = "Quantity (1000 MT)",
+       x = "Year",
+       color = NULL) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "top")
+
+paraguay %>% 
+  filter(item == "Bovine Meat" | item == "Pigmeat") %>% 
+  filter(element_code == 645) %>%
+  mutate(event = case_when(item == "Bovine Meat" & year %in% 1961:1987 ~ 1,
+                           item == "Pigmeat" & year %in% 1961:1983 ~ 1,
+                           TRUE ~ 0)) %>% 
+  ggplot(aes(x = year, y = quantity, color = item, group = item)) +
+  geom_line() +
+  geom_point() +
+  geom_line(data = . %>% filter(event == 1), aes(color = item, group = item), size = 4, alpha = 0.25, show.legend = FALSE) +
+  labs(title = "Paraguay",
+       y = "Quantity (kg/capita/yr)",
+       x = "Year",
+       color = NULL) +
+  scale_color_paletteer_d("LaCroixColoR::Lemon", direction = -1) +
+  cowplot::theme_cowplot() +
+  theme(legend.position = "top")
+```
+
+
+```{r}
+
+test2 <- map(.x = group_split(coincident_inclines, area_code, item_code),
+             .f = ~{
+               food_balance %>% 
+                 filter(area_code == .x$area_code,
+                        item_code == .x$item_code | item_code == .x$item_code_incline) %>% 
+                 ggplot(aes(x = year, y = quantity, color = item, group = item)) +
+                 geom_line() +
+                 geom_point() +
+                 # geom_line(data = ts_w_declines_df %>%
+                 #             filter(area_code == {.x$area_code},
+                 #                    item_code == {.x$item_code},
+                 #                    !is.na(event_id)),
+                 #           aes(color = item, group = item), size = 4, alpha = 0.25, show.legend = FALSE) +
+                 # geom_line(data = ts_w_inclines_df %>% 
+                 #             filter(area_code == .x$area_code,
+                 #                    item_code == .x$item_code_incline,
+                 #                    !is.na(event)), 
+                 #           aes(color = item, group = item), size = 4, alpha = 0.25, show.legend = FALSE) +
+                 labs(title = unique(.$area),
+                      y = "Quantity (kg/capita/yr)",
+                      x = "Year",
+                      color = NULL) +
+                 scale_color_paletteer_d("LaCroixColoR::Lemon", direction = -1) +
+                 cowplot::theme_cowplot() +
+                 theme(legend.position = "top")
+             })
+
+pdf(here("output", "figs", paste0("coincident_inclines_", Sys.Date(), ".pdf")), height = 11, width = 8.5)
+ggarrange(plotlist = test2, ncol = 1, nrow = 3, align = "v")
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+#case study analysis
+
+import the food balance data
+```{r}
+
+food_balance <- vroom(file.path(dir_data_bottlenecks, "FAO", "food_balances", "food_balance_tidy.csv"), delim = ",", locale = locale(encoding = "latin1"))
+
+
+population <- food_balance %>% filter(element == "Total Population - Both sexes") %>% 
+  mutate(pop = quantity*1000) %>% select(area_code, area, year, pop)
+
+```
+
+Indonesia shift from cassava to wheat and rice
+
+```{r}
+
+indo_roots_cereals_df <-  food_balance %>% 
+  filter(area=="Indonesia" & element %in% c("Food supply quantity (kg/capita/yr)", "Harvestable Area",  "Production", "Import Quantity", "Export Quantity") & item %in% c("Cassava and products", "Sweet potatoes", "Wheat and products", "Rice (Milled Equivalent)")) %>% 
+  left_join(population, by=c("area_code", "area", "year")) %>% 
+  mutate(quantity = case_when(element == "Import Quantity" ~ quantity*1e+6/pop,
+                              element == "Export Quantity" ~ quantity*1e+6/pop,
+                              element == "Production" ~ quantity*1e+6/pop, 
+                              element == "Food supply quantity (kg/capita/yr)" ~ quantity)) %>% 
+  select(item, element, year, quantity)
+
+#cassava and rice pairing
+(cassava <- indo_roots_cereals_df %>% 
+  filter(item=="Cassava and products" & element!="Harvestable Area"  & year %in% c(1962:1971)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(rice <- indo_roots_cereals_df %>% 
+  filter(item=="Rice (Milled Equivalent)" & element!="Harvestable Area" & year %in% c(1962:1971)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+#sweet potatoes and wheat
+(sweet_pots <- indo_roots_cereals_df %>% 
+  filter(item=="Sweet potatoes" & element!="Harvestable Area" & year %in% c(1962:2006)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(wheat <- indo_roots_cereals_df %>% 
+  filter(item=="Wheat and products" & element!="Harvestable Area" & year %in% c(1962:2006)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year")
+)
+
+#What are the most associated supply components responsible?
+
+main_driver(cassava) #declines in cassava - production
+main_driver(rice) #inclines in rice - production
+main_driver(sweet_pots) #declines in sweet potatoes - production
+main_driver(wheat) #inclines in wheat through imports
+
+indo_raw <- food_balance %>% 
+  filter(area=="Indonesia" & element %in% c("Food supply quantity (kg/capita/yr)", "Production", "Import Quantity", "Export Quantity") & item %in% c("Cassava and products", "Sweet potatoes", "Wheat and products", "Rice (Milled Equivalent)")) %>% 
+  left_join(population, by=c("area_code", "area", "year")) %>% 
+  arrange(item, element, year)
+
+
+
+
+```
+
+Australia - mutton to chicken
+
+```{r}
+
+(aus_sheep_pltry_df <-  food_balance %>% 
+  filter(area=="United States of America" & element %in% c("Food supply quantity (kg/capita/yr)", "Production", "Import Quantity", "Export Quantity") & item %in% c( "Poultry Meat", "Bovine Meat")) %>% 
+  left_join(population, by=c("area_code", "area", "year")) %>% 
+  mutate(quantity = case_when(element == "Import Quantity" ~ quantity*1e+6/pop,
+                              element == "Export Quantity" ~ quantity*1e+6/pop,
+                              element == "Production" ~ quantity*1e+6/pop, 
+                              element == "Food supply quantity (kg/capita/yr)" ~ quantity)) %>% 
+  select(item, element, year, quantity))
+
+
+(sheep <- aus_sheep_pltry_df %>% 
+  filter(item=="Mutton & Goat Meat" & year %in% c(1961:1979)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(beef <- aus_sheep_pltry_df %>% 
+  filter(item=="Bovine Meat" & year %in% c(1978:1997)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(poultry <- aus_sheep_pltry_df %>% 
+  filter(item=="Poultry Meat" & year %in% c(1961:1979)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+#production caused the incline and decline of poultry and mutton respectively
+#main_driver(sheep)
+main_driver(poultry)
+main_driver(beef)
+
+ggplot(aus_sheep_pltry_df %>% filter(item=="Bovine Meat" & element=="Production") %>% mutate(rel = quantity/quantity[1]), aes(x=year, y=rel))+geom_line()+geom_smooth(formula = y ~ s(x), method = "gam")
+```
+
+Japan - fish to meat
+
+```{r}
+
+(japan_fish_meat_df <-  food_balance %>% 
+  filter(area=="Japan" & element %in% c("Food supply quantity (kg/capita/yr)", "Harvestable Area", "Production", "Import Quantity", "Export Quantity", "Feed") & item %in% c("Marine Fish, Other", "Pelagic Fish", "Demersal Fish", "Molluscs, Other",  "Pigmeat", "Poultry Meat")) %>% 
+  left_join(population, by=c("area_code", "area", "year")) %>% 
+  mutate(quantity = case_when(element == "Import Quantity" ~ quantity*1e+6/pop,
+                              element == "Export Quantity" ~ quantity*1e+6/pop,
+                              element == "Production" ~ quantity*1e+6/pop, 
+                              element == "Food supply quantity (kg/capita/yr)" ~ quantity, 
+                              element == "Feed" ~ quantity*1e+6/pop)) %>% 
+  select(item, element, year, quantity))
+
+#Seafood
+(pel_fish <- japan_fish_meat_df %>% 
+  filter(item=="Pelagic Fish" & element!="Harvestable Area" & year %in% c(1985:2013)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(dem_fish <- japan_fish_meat_df %>% 
+  filter(item=="Demersal Fish" & element!="Harvestable Area"& year %in% c(1986:2013)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(mar_fish <- japan_fish_meat_df %>% 
+  filter(item=="Marine Fish, Other" & element!="Harvestable Area" & year %in% c(2004:2013)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+(molls <- japan_fish_meat_df %>% 
+  filter(item=="Molluscs, Other" & element!="Harvestable Area" & year %in% c(1997:2013)) %>% #selects the decline years
+  select(-item) %>% 
+  pivot_wider(names_from = element, values_from = quantity) %>% 
+  column_to_rownames("year"))
+
+
+#main correlates during the decline were because of declining production for demersal and pelagic fish and imports for 
+main_driver(pel_fish)
+main_driver(dem_fish)
+main_driver(mar_fish)
+main_driver(molls)
+
+
+```
+
+#Figures
+```{r}
+#palette
+pal <- "beyonce::X18"
+pal <- "beyonce::X6"
+
+scales::show_col(paletteer_d(pal))
+
+#png images
+cassava_img <- readPNG(here("explore", "cottrell_explore", "PNGs", "cassava.png"))
+cassava_img <- grid::rasterGrob(cassava_img)
+
+
+rice_img <- readPNG(here("explore", "cottrell_explore", "PNGs", "rice.png"))
+rice_img<- grid::rasterGrob(rice_img)
+
+cow_img <- readPNG(here("explore", "cottrell_explore", "PNGs", "cow.png"))
+cow_img <- grid::rasterGrob(cow_img)
+
+chook_img <- readPNG(here("explore", "cottrell_explore", "PNGs", "henedit.png"))
+chook_img <- grid::rasterGrob(chook_img)
+
+fish_img <- readPNG(here("explore", "cottrell_explore", "PNGs", "grouper.png"))
+fish_img <- grid::rasterGrob(fish_img)
+
+
+#Indonesia
+
+cass_declines <- indo_roots_cereals_df %>% 
+  filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+  mutate(item = case_when(item %in% c("Rice (Milled Equivalent)", "Wheat and products") ~ "Rice & wheat", 
+                          item == c("Cassava and products", "Sweet potatoes") ~ "Cassava and sweet potatoes",
+                          TRUE ~ item)) %>%
+  filter(item=="Cassava and sweet potatoes") %>% 
+  group_by(item, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year %in% c(1962:1971, 1976:2004))
+
+sweet_pot_declines <- indo_roots_cereals_df %>% 
+  filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+  mutate(item = case_when(item %in% c("Rice (Milled Equivalent)", "Wheat and products") ~ "Rice & wheat", 
+                          item == c("Cassava and products", "Sweet potatoes") ~ "Cassava and sweet potatoes",
+                          TRUE ~ item)) %>%
+  filter(item=="Cassava and sweet potatoes") %>% 
+  group_by(item, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year %in% c(1962:2006))
+
+rice_inclines <- indo_roots_cereals_df %>% 
+  filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+  mutate(item = case_when(item %in% c("Rice (Milled Equivalent)", "Wheat and products") ~ "Rice & wheat", 
+                          item == c("Cassava and products", "Sweet potatoes") ~ "Cassava and sweet potatoes",
+                          TRUE ~ item))%>% 
+  filter(item=="Rice & wheat") %>%
+  group_by(item, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year %in% c(1962:1987))
+
+
+
+
+wheat_inclines <- indo_roots_cereals_df %>% 
+  filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+  mutate(item = case_when(item %in% c("Rice (Milled Equivalent)", "Wheat and products") ~ "Rice & wheat", 
+                          item == c("Cassava and products", "Sweet potatoes") ~ "Cassava and sweet potatoes",
+                          TRUE ~ item)) %>% 
+  filter(item=="Rice & wheat") %>% 
+  group_by(item, year) %>% 
+  summarise(quantity = sum(quantity)) %>% 
+  filter(year %in% c(1964:2013))
+
+label_pos <- tibble(item = c("Rice & wheat", "Cassava & sweet\npotatoes"), x_pos=c(2004, 2004), y_pos =c(170,75), cols = as.character(paletteer_d(pal)[c(2,5)]))
+
+indo_plot <- ggplot(data = indo_roots_cereals_df %>% 
+                      filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+                      mutate(item = case_when(item %in% c("Rice (Milled Equivalent)", "Wheat and products") ~ "Rice & wheat", 
+                                              item == c("Cassava and products", "Sweet potatoes") ~ "Cassava and sweet potatoes",
+                                              TRUE ~ item)) %>%
+                      group_by(item, year) %>% 
+                      summarise(quantity = sum(quantity)) %>% 
+                      ungroup(),
+                    aes(x = year, y=quantity, colour=item))+
+  geom_line(size=0.6)+
+  #geom_line(data = cass_declines, aes(x=year, y=quantity), colour=paletteer_d(pal)[5], size=2.5, alpha=0.3)+
+  #geom_line(data = sweet_pot_declines, aes(x=year, y=quantity), colour=paletteer_d(pal)[5], size=2.5, alpha=0.15)+
+  #geom_line(data = rice_inclines, aes(x=year, y=quantity), colour=paletteer_d(pal)[2], size=2.5, alpha=0.3)+
+  #geom_line(data = wheat_inclines, aes(x=year, y=quantity), colour=paletteer_d(pal)[2], size=2.5, alpha=0.15)+
+  scale_color_manual(values = paletteer_d(pal)[c(5,2)]) + 
+  scale_y_continuous(limits = c(0,170))+
+  cowplot::theme_half_open() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        legend.text = element_text(size=6),
+        text = element_text(size=8),
+        axis.text = element_text(size=8))+
+  labs(subtitle = "Indonesia", y = bquote(Food~supply~(kg~capita^-1~yr^-1)), x="Year")+
+  annotation_custom(cassava_img, xmin = 1998, xmax = 2003, ymin=2, ymax=27)+
+  annotation_custom(rice_img, xmin = 2008, xmax = 2013, ymin=2, ymax=27)+
+  guides(colour=FALSE)+
+  geom_text(data = label_pos, aes(x=x_pos, y=y_pos, label=item), colour = "black", size=2) +
+  geom_segment(x = 2003, xend = 2008, y = 15, yend=15, arrow = arrow(ends = "last", type="open", length = unit(0.1, "cm")), colour="black", size=0.2)
+
+
+ggsave(here("explore", "cottrell_explore", "indo_cassava.jpeg"), device = "jpg", dpi=300, width=7, height=6, units = "cm") 
+
+
+
+
+
+
+
+#Australia
+
+label_pos <- tibble(item = c("Poultry", "Beef"), x_pos=c(2010, 2010), y_pos =c(56,32), cols = as.character(paletteer_d(pal)[c(2,5)]))
+
+
+beef_declines <- aus_sheep_pltry_df %>% filter(element=="Food supply quantity (kg/capita/yr)" & item=="Bovine Meat" & year %in% c(1976:1997))
+
+chook_inclines <- aus_sheep_pltry_df %>% filter(element=="Food supply quantity (kg/capita/yr)" & item=="Poultry Meat" & year %in% c(1961:2013))
+
+legend_point <- tibble(year = 1980, quantity = 9)
+
+legend_label <- tibble(year = 1982, quantity=9, label= "Decline/incline events")
+
+aus_plot <- ggplot(aus_sheep_pltry_df %>% filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+                     mutate(item = case_when(item == "Bovine Meat" ~ "Beef",
+                                             item == "Poultry Meat" ~ "Poultry"),
+                            item = factor(item, levels = c("Poultry", "Beef"))),
+                   aes(x = year, y=quantity, colour=item))+
+  geom_line(size=0.6)+
+  # geom_point(data = beef_declines, aes(x=year, y=quantity), colour=paletteer_d(pal)[5], size=0.5, shape =21)+
+  # geom_point(data = chook_inclines, aes(x=year, y=quantity), colour=paletteer_d(pal)[2], size=0.5, shape=21)+
+  # geom_point(data = legend_point, aes(aes = year, y=quantity), colour="black", size=0.8, shape = 21)+
+  scale_color_manual(values = paletteer_d(pal)[c(2,5)]) +
+  
+  cowplot::theme_half_open() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        legend.text = element_text(size=6),
+        text = element_text(size=8),
+        axis.text = element_text(size=8),
+        axis.title.y = element_blank())+
+  annotation_custom(cow_img, xmin = 1997, xmax = 2003, ymin=0, ymax=8)+
+  annotation_custom(chook_img, xmin = 2008, xmax = 2013, ymin=2, ymax=8)+
+  guides(colour=FALSE)+
+  labs(subtitle = "Australia", y = bquote(Food~supply~(kg~capita^-1~yr^-1)), x="Year")+
+  scale_y_continuous(limits = c(0,62))+
+  geom_segment(x = 2004, xend = 2008, y = 5, yend=5, arrow = arrow(ends = "last", type="open", length = unit(0.1, "cm")), colour="black", size=0.2)+
+  geom_text(data = label_pos, aes(x=x_pos, y=y_pos, label=item), colour = "black", size=2)
+#geom_text(data = legend_label, aes(x=year, y=quantity, label = label), colour="black", size=1.8, hjust=0)+
+
+ggsave(here("explore", "cottrell_explore", "aus_beef.jpeg"), device = "jpg", dpi=300, width=6, height=5, units = "cm")
+
+
+
+#Japan
+
+label_pos <- tibble(fish_meat_item = c("Poultry & pork", "Fish & molluscs"), x_pos=c(1990, 1990), y_pos =c(37,57), cols = as.character(paletteer_d(pal)[c(2,5)]))
+
+
+fish_declines <- japan_fish_meat_df %>% filter(element=="Food supply quantity (kg/capita/yr)" & grepl("Fish|Molluscs", item) & year %in% c(1985:2013)) %>% group_by(element, year) %>% 
+  summarise(quantity = sum(quantity))
+
+chook_pork_inclines <- japan_fish_meat_df %>% filter(element=="Food supply quantity (kg/capita/yr)" & item %in% c("Pigmeat", "Poultry Meat") & year %in% c(1961:2013)) %>% group_by(element, year) %>% 
+  summarise(quantity = sum(quantity))
+
+
+
+japan_plot <- ggplot(japan_fish_meat_df %>% filter(element=="Food supply quantity (kg/capita/yr)") %>% 
+                       mutate(fish_meat_item = case_when(grepl("Fish|Molluscs", item) ~ "Fish & molluscs",
+                                                         TRUE ~  "Poultry & pork")) %>% 
+                       group_by(year, fish_meat_item) %>% 
+                       summarise(quantity = sum(quantity)), 
+                     aes(x = year, y=quantity, colour=fish_meat_item))+
+  geom_line(size=0.6)+
+  # geom_point(data = fish_declines, aes(x=year, y=quantity), colour=paletteer_d(pal)[5], size=0.5, shape =21)+
+  # geom_point(data = chook_pork_inclines, aes(x=year, y=quantity), colour=paletteer_d(pal)[2], size=0.5, shape=21)+
+  scale_color_manual(values = paletteer_d(pal)[c(5,2)]) +
+  cowplot::theme_half_open() +
+  theme(legend.title = element_blank(),
+        legend.position = c(0.8, 0.1),
+        text = element_text(size=8),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size=8))+
+  scale_y_continuous(limits = c(0,62))+
+  labs(subtitle = "Japan", y = bquote(Food~supply~(kg~capita^-1~yr^-1)), x="Year")+
+  annotation_custom(fish_img, xmin = 1995.5, xmax = 2003, ymin=-3, ymax=10)+
+  annotation_custom(chook_img, xmin = 2008, xmax = 2013, ymin=0, ymax=6)+
+  geom_segment(x = 2003.5, xend = 2008, y = 4, yend=4, arrow = arrow(ends = "last", type="open", length = unit(0.1, "cm")), colour="black", size=0.2)+
+  geom_text(data = label_pos, aes(x=x_pos, y=y_pos, label=fish_meat_item), size=2, colour="black")+
+  guides(colour=FALSE)
+
+
+ggsave(here("explore", "cottrell_explore", "japan_fish.jpeg"), device = "jpg", dpi=300, width=6, height=5, units = "cm")
+
+
+
+
+
+```
+
+
+#Compose plot
+```{r}
+ggarrange(indo_plot, aus_plot, japan_plot,
+          nrow=1,
+          ncol=3,
+          labels = letters[1:3],
+          font.label = list(size=10),
+          widths = c(1.11,1,1))
+
+ggsave(here("output", "figs", "declines_ms", "fig_case_studies.jpg"), device="jpg", dpi=600, width = 18, height=6, units = "cm")
+```
+
